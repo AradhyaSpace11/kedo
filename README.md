@@ -40,17 +40,17 @@ Kedo helps users maintain healthy eating habits through AI-driven meal planning,
 ## Screenshots
 
 ### Home Screen
-![Home Screen](https://via.placeholder.com/400x800/0B1117/E6EAF2?text=Home+Screen)
+![Home Screen](pages/homepage.png)
 
 The home screen displays daily macro progress, meal recommendations, and quick actions for meal management. Users can view detailed recipes, mark meals as consumed, and request alternative suggestions.
 
 ### Pantry Screen
-![Pantry Screen](https://via.placeholder.com/400x800/0B1117/E6EAF2?text=Pantry+Screen)
+![Pantry Screen](pages/pantry.png)
 
 The pantry screen allows users to manage their food inventory, update quantities, and rebuild their pantry using AI-powered text analysis.
 
 ### Profile Screen
-![Profile Screen](https://via.placeholder.com/400x800/0B1117/E6EAF2?text=Profile+Screen)
+![Profile Screen](pages/profile.png)
 
 The profile screen enables users to set personal health metrics, dietary preferences, and upload prescription images for personalized recommendations.
 
