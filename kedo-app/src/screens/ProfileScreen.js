@@ -1,33 +1,38 @@
 import React, { useState } from 'react';
-import { View, Text, TextInput, StyleSheet, ScrollView, TouchableOpacity, Image } from 'react-native';
+import { View, Text, TextInput, StyleSheet, ScrollView, TouchableOpacity, Image, Alert } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { post, postForm } from '../lib/api';
 
 export default function ProfileScreen() {
-  const [name, setName] = useState('');
-  const [age, setAge] = useState('26');
-  const [gender, setGender] = useState('female');
-  const [height, setHeight] = useState('158');
-  const [weight, setWeight] = useState('60');
-  const [goal, setGoal] = useState('weight_loss');
-  const [restrictions, setRestrictions] = useState('');
+  const [name, setName] = useState('Aradhya Gaonkar');
+  const [age, setAge] = useState('21');
+  const [gender, setGender] = useState('male');
+  const [height, setHeight] = useState('178');
+  const [weight, setWeight] = useState('72');
+  const [goal, setGoal] = useState('keto style diet');
+  const [restrictions, setRestrictions] = useState('Indian keto style, no beef, no pork');
   const [allergies, setAllergies] = useState('');
   const [activity, setActivity] = useState('moderate');
 
   async function save() {
-    await post('/user/profile', {
-      name, age: +age, gender, height: +height, weight: +weight, goal,
-      restrictions: restrictions ? restrictions.split(',').map(s => s.trim()).filter(Boolean) : [],
-      allergies: allergies ? allergies.split(',').map(s => s.trim()).filter(Boolean) : [],
-      activity
-    });
+    try {
+      await post('/user/profile', {
+        name, age: +age, gender, height: +height, weight: +weight, goal,
+        restrictions: restrictions ? restrictions.split(',').map(s => s.trim()).filter(Boolean) : [],
+        allergies: allergies ? allergies.split(',').map(s => s.trim()).filter(Boolean) : [],
+        activity
+      });
+      Alert.alert('Saved', 'Profile updated.');
+    } catch (error) {
+      Alert.alert('Could not save profile', error.message);
+    }
   }
 
   const [prescriptionUri, setPrescriptionUri] = useState('');
   async function choosePrescription() {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') return;
-    const res = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, quality: 0.8 });
+    const res = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.8 });
     if (!res.canceled) {
       const uri = res.assets?.[0]?.uri || '';
       setPrescriptionUri(uri);
@@ -38,7 +43,12 @@ export default function ProfileScreen() {
     const form = new FormData();
     const name = prescriptionUri.split('/').pop() || 'prescription.jpg';
     form.append('file', { uri: prescriptionUri, name, type: 'image/jpeg' });
-    await postForm('/user/prescription', form);
+    try {
+      await postForm('/user/prescription', form);
+      Alert.alert('Uploaded', 'Prescription image uploaded.');
+    } catch (error) {
+      Alert.alert('Could not upload image', error.message);
+    }
   }
 
   return (

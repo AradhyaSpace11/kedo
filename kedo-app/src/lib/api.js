@@ -33,7 +33,6 @@ export async function post(path, body) {
 export async function postForm(path, formData) {
   try {
     const r = await axios.post(API + path, formData, { 
-      headers: { 'Content-Type': 'multipart/form-data' },
       timeout: API_CONFIG.TIMEOUT 
     });
     return r.data;

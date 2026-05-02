@@ -1,9 +1,13 @@
+import { Platform } from 'react-native';
+
 // API Configuration
 // This file contains configuration settings for the Kedo app
 
+const DEFAULT_BASE_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8000' : 'http://localhost:8000';
+
 export const API_CONFIG = {
   // Server URL - change this to your server address
-  BASE_URL: 'http://10.0.2.2:8000', // Android emulator
+  BASE_URL: process.env.EXPO_PUBLIC_API_URL || DEFAULT_BASE_URL,
   // BASE_URL: 'http://localhost:8000', // iOS simulator
   // BASE_URL: 'http://your-server-ip:8000', // Physical device
   
@@ -17,7 +21,7 @@ export const API_CONFIG = {
   },
   
   // Request timeout (in milliseconds)
-  TIMEOUT: 10000,
+  TIMEOUT: 60000, // Increased to 60s for slow LLM generations
   
   // Retry configuration
   RETRY_ATTEMPTS: 3,

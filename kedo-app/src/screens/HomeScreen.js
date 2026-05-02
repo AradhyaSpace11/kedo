@@ -1,11 +1,54 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, Button, Modal, TextInput, ScrollView, TouchableOpacity, StyleSheet, Image, Animated, Easing } from 'react-native';
+import { View, Text, Alert, Modal, TextInput, ScrollView, TouchableOpacity, StyleSheet, Image, Animated, Easing } from 'react-native';
 import * as Calendar from 'expo-calendar';
+import { useFocusEffect } from '@react-navigation/native';
 import BarChart from '../components/BarChart';
 import { get, post } from '../lib/api';
 import { FEATURE_FLAGS } from '../config/api';
 
 const e = (s) => (s == null ? '' : String(s));
+
+const stableSeed = (value) => {
+  let hash = 2166136261;
+  const text = String(value || 'simple keto meal');
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+};
+
+const generatedFoodImageUrl = (query) => {
+  const clean = String(query || 'simple keto meal').replace(/\s+/g, ' ').trim();
+  const prompt = `realistic food photo of ${clean}, Indian keto home cooking, single plated dish, natural light, clearly showing the meal, no text`;
+  return `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=900&height=600&model=flux&seed=${stableSeed(clean)}&safe=true`;
+};
+
+const imagePromptForMeal = (meal) => {
+  const ingredients = Array.isArray(meal?.ingredients)
+    ? meal.ingredients.slice(0, 4).map((item) => item?.item).filter(Boolean).join(' ')
+    : '';
+  return `${meal?.dish_name || 'simple keto meal'} ${ingredients}`.trim();
+};
+
+const isRenderableImageUrl = (url) => (
+  typeof url === 'string'
+  && /^https?:\/\//i.test(url)
+  && !url.includes('source.unsplash.com')
+  && !url.includes('unsplash.com/photos')
+);
+const isGeneratedFoodImageUrl = (url) => (
+  typeof url === 'string'
+  && (url.includes('gen.pollinations.ai/image/') || url.includes('image.pollinations.ai/prompt/'))
+);
+
+function withRenderableImage(meal) {
+  const existing = isRenderableImageUrl(meal?.image) && isGeneratedFoodImageUrl(meal.image) ? meal.image : null;
+  return {
+    ...meal,
+    image: existing || generatedFoodImageUrl(imagePromptForMeal(meal)),
+  };
+}
 
 const DUMMY_MEALS = [
   {
@@ -85,40 +128,70 @@ function CardContainer({ loading, children }) {
 }
 
 export default function HomeScreen() {
-  const [meals, setMeals] = useState(DUMMY_MEALS.map((m, i) => ({ ...m, _slot: SLOTS[i] || 'Meal' })));
+  const [meals, setMeals] = useState(null);
+  const [notice, setNotice] = useState('');
   const [totals, setTotals] = useState({ protein: 0, carbs: 0, fat: 0 });
   const [targets, setTargets] = useState({ calories: 0, protein: 0, carbs: 0, fat: 0 });
   const [clarModal, setClarModal] = useState(false);
   const [mealTimes, setMealTimes] = useState({ breakfast: '08:00', lunch: '13:00', dinner: '20:00' });
   const [customModal, setCustomModal] = useState(false);
   const [customText, setCustomText] = useState('');
+  const [directionModal, setDirectionModal] = useState(false);
+  const [directionText, setDirectionText] = useState('');
+  const [directionTarget, setDirectionTarget] = useState(null);
 
   async function fetchMeals() {
     try {
+      setNotice('');
+      const plan = await get('/plan/today');
+      if (Array.isArray(plan?.meals) && plan.meals.length === 3) {
+        setMeals(plan.meals.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' })));
+        return;
+      }
       const r = await get('/meals/recommendations');
-      if (r.state === 'NEED_CLARIFICATION') { setClarModal(true); setMeals(DUMMY_MEALS.map((m, i) => ({ ...m, _slot: SLOTS[i] || 'Meal' }))); return; }
-      if (r.error) { setMeals(DUMMY_MEALS.map((m, i) => ({ ...m, _slot: SLOTS[i] || 'Meal' }))); return; }
-      const arr = Array.isArray(r.meals) && r.meals.length ? r.meals : DUMMY_MEALS;
-      setMeals(arr.map((m, i) => ({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' })));
+      if (r.state === 'NEED_CLARIFICATION') { setClarModal(true); setMeals([]); return; }
+      if (r.state === 'NEED_PANTRY') { setNotice(r.message || 'Add pantry items before requesting meals.'); setMeals([]); return; }
+      if (r.state === 'LLM_ERROR' || r.error) {
+        const partial = Array.isArray(r.meals) ? r.meals : [];
+        setMeals(partial.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' })));
+        setNotice(partial.length ? 'Showing the pantry-only meals available from this pantry.' : 'Could not make pantry-only recommendations from the current pantry.');
+        return;
+      }
+      const arr = Array.isArray(r.meals) ? r.meals : [];
+      setMeals(arr.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' })));
     } catch (e) {
-      setMeals(DUMMY_MEALS.map((m, i) => ({ ...m, _slot: SLOTS[i] || 'Meal' })));
+      setNotice('Could not reach the meal server.');
+      setMeals([]);
     }
   }
+
+  async function fetchMacros() {
+    try {
+      const t = await get('/macros/targets');
+      if (t?.targets) setTargets(t.targets);
+      const d = await get('/macros/today');
+      if (d?.totals) setTotals(d.totals);
+    } catch {}
+  }
+
+  useFocusEffect(
+    React.useCallback(() => {
+      fetchMeals();
+      fetchMacros();
+    }, [])
+  );
+
   async function resolveClar() {
-    await post('/clarifications/resolve', { meal_times: mealTimes });
-    setClarModal(false);
-    fetchMeals();
+    try {
+      await post('/clarifications/resolve', { meal_times: mealTimes });
+      setClarModal(false);
+      fetchMeals();
+    } catch (error) {
+      Alert.alert('Could not save meal times', error.message);
+    }
   }
   useEffect(() => {
-    fetchMeals();
-    (async () => {
-      try {
-        const t = await get('/macros/targets');
-        if (t?.targets) setTargets(t.targets);
-        const d = await get('/macros/today');
-        if (d?.totals) setTotals(d.totals);
-      } catch {}
-    })();
+    fetchMacros();
   }, []);
 
   async function onEaten(m) {
@@ -127,8 +200,12 @@ export default function HomeScreen() {
       carbs: t.carbs + (m.macros?.carbs || 0),
       fat: t.fat + (m.macros?.fat || 0),
     }));
-    const r = await post('/meals/log_eaten', m);
-    if (r?.totals) setTotals(r.totals);
+    try {
+      const r = await post('/meals/log_eaten', m);
+      if (r?.totals) setTotals(r.totals);
+    } catch (error) {
+      Alert.alert('Could not log meal', error.message);
+    }
   }
   function toggleEaten(idx) {
     setMeals(old => {
@@ -142,23 +219,47 @@ export default function HomeScreen() {
       return copy;
     });
   }
-  async function suggestAnother(slot, idx) {
+  async function suggestAnother(slot, idx, guidance = '') {
     setMeals(old => { if (!old) return old; const copy = [...old]; copy[idx] = { ...(copy[idx]||{}), _loading: true }; return copy; });
-    const r = await get('/meals/suggest_another', { slot });
+    let r;
+    try {
+      const params = guidance.trim() ? { slot, guidance: guidance.trim() } : { slot };
+      r = await get('/meals/suggest_another', params);
+    } catch (error) {
+      Alert.alert('Could not suggest a meal', error.message);
+      setMeals(old => { if (!old) return old; const copy = [...old]; if (copy[idx]) copy[idx]._loading = false; return copy; });
+      return;
+    }
     if (!r || r.error) { setMeals(old => { if (!old) return old; const copy = [...old]; if (copy[idx]) copy[idx]._loading = false; return copy; }); return; }
     const oneRaw = Array.isArray(r.meal) ? r.meal[0] : r.meal;
     if (!oneRaw || typeof oneRaw !== 'object') { setMeals(old => { if (!old) return old; const copy = [...old]; if (copy[idx]) copy[idx]._loading = false; return copy; }); return; }
-    const one = {
+    const one = withRenderableImage({
       dish_name: oneRaw.dish_name || 'Meal',
-      image: oneRaw.image || null,
+      image: oneRaw.image,
       macros: oneRaw.macros || { protein: 0, carbs: 0, fat: 0 },
       ingredients: Array.isArray(oneRaw.ingredients) ? oneRaw.ingredients : [],
       recipe_steps: Array.isArray(oneRaw.recipe_steps) ? oneRaw.recipe_steps : [],
       video_link: oneRaw.video_link || null,
       _slot: SLOTS[idx] || oneRaw._slot || 'Meal',
       _loading: false,
-    };
+    }, SLOTS[idx] || 'Meal');
     setMeals(old => { if (!old) return old; const copy = [...old]; copy[idx] = one; return copy; });
+  }
+
+  function openDirectedSuggest(slot, idx) {
+    setDirectionTarget({ slot, idx });
+    setDirectionText('');
+    setDirectionModal(true);
+  }
+
+  async function submitDirectedSuggest() {
+    if (!directionTarget) return;
+    const target = directionTarget;
+    const text = directionText;
+    setDirectionModal(false);
+    setDirectionTarget(null);
+    setDirectionText('');
+    await suggestAnother(target.slot, target.idx, text);
   }
   async function addToCalendar() {
     if (!FEATURE_FLAGS.CALENDAR_INTEGRATION) {
@@ -217,7 +318,13 @@ export default function HomeScreen() {
   }
   async function submitCustomFood() {
     if (!customText.trim()) { setCustomModal(false); return; }
-    const r = await post('/meals/log_custom', { free_text: customText });
+    let r;
+    try {
+      r = await post('/meals/log_custom', { free_text: customText });
+    } catch (error) {
+      Alert.alert('Could not log food', error.message);
+      return;
+    }
     const m = r?.macros || { protein: 0, carbs: 0, fat: 0 };
     setTotals(t => ({ protein: t.protein + (+m.protein || 0), carbs: t.carbs + (+m.carbs || 0), fat: t.fat + (+m.fat || 0) }));
     setCustomText(''); setCustomModal(false);
@@ -225,20 +332,27 @@ export default function HomeScreen() {
   async function recommendSnack() {
     // add placeholder loading card
     setMeals(old => (old ? [...old, { dish_name: 'Thinking…', _slot: 'Snack', _loading: true, macros: { protein: 0, carbs: 0, fat: 0 }, ingredients: [], recipe_steps: [] }] : [{ dish_name: 'Thinking…', _slot: 'Snack', _loading: true, macros: { protein: 0, carbs: 0, fat: 0 }, ingredients: [], recipe_steps: [] }]));
-    const r = await get('/meals/recommend_snack', { max_calories: 300 });
+    let r;
+    try {
+      r = await get('/meals/recommend_snack', { max_calories: 300 });
+    } catch (error) {
+      Alert.alert('Could not recommend snack', error.message);
+      setMeals(old => (old ? old.filter((m, i) => i !== old.length - 1) : old));
+      return;
+    }
     if (!r || r.error) { setMeals(old => (old ? old.filter((m, i) => i !== old.length - 1) : old)); return; }
     const snackRaw = Array.isArray(r.meal) ? r.meal[0] : r.meal;
     if (!snackRaw || typeof snackRaw !== 'object') { setMeals(old => (old ? old.filter((m, i) => i !== old.length - 1) : old)); return; }
-    const withSlot = {
+    const withSlot = withRenderableImage({
       dish_name: snackRaw.dish_name || 'Snack',
-      image: snackRaw.image || null,
+      image: snackRaw.image,
       macros: snackRaw.macros || { protein: 0, carbs: 0, fat: 0 },
       ingredients: Array.isArray(snackRaw.ingredients) ? snackRaw.ingredients : [],
       recipe_steps: Array.isArray(snackRaw.recipe_steps) ? snackRaw.recipe_steps : [],
       video_link: snackRaw.video_link || null,
       _slot: 'Snack',
       _loading: false,
-    };
+    }, 'Snack');
     setMeals(old => { if (!old) return [withSlot]; const copy = [...old]; copy[copy.length - 1] = withSlot; return copy; });
   }
 
@@ -280,12 +394,35 @@ export default function HomeScreen() {
       </View>
 
       <Text style={styles.h2}>Recommendations</Text>
+      {!!notice && <Text style={{ color: '#FBBF24', marginBottom: 8 }}>{notice}</Text>}
+      {Array.isArray(meals) && meals.length === 0 && !notice && (
+        <Text style={{ color: '#9CA3AF', marginBottom: 8 }}>No pantry-only meals available yet.</Text>
+      )}
       {!meals && <Text style={{ color: '#9CA3AF' }}>Loading or waiting for clarification…</Text>}
 
       {meals && meals.filter(Boolean).map((m, idx) => (
         <CardContainer key={idx} loading={!!m._loading}>
-          {!!m.image && (
-            <Image source={{ uri: m.image }} style={styles.cardImage} resizeMode="cover" />
+          {m.image ? (
+            <Image
+              source={{ uri: m.image }}
+              style={styles.cardImage}
+              resizeMode="cover"
+              onError={() => {
+                setMeals(old => {
+                  if (!old?.[idx]) return old;
+                  const copy = [...old];
+                  const current = copy[idx];
+                  copy[idx] = isGeneratedFoodImageUrl(current.image)
+                    ? { ...current, image: null, _imageFailed: true }
+                    : { ...current, image: generatedFoodImageUrl(imagePromptForMeal(current)) };
+                  return copy;
+                });
+              }}
+            />
+          ) : (
+            <View style={[styles.cardImage, styles.cardImageFallback]}>
+              <Text style={styles.cardImageFallbackText}>{m.dish_name || 'Keto meal'}</Text>
+            </View>
           )}
           {!!m._slot && (
             <View style={styles.badge}><Text style={styles.badgeText}>{m._slot}</Text></View>
@@ -296,7 +433,12 @@ export default function HomeScreen() {
           </Text>
 
           <View style={styles.row}>
-            <TouchableOpacity style={[styles.btn, styles.btnSecondary]} onPress={() => suggestAnother(SLOTS[idx] || 'Meal', idx)}>
+            <TouchableOpacity
+              style={[styles.btn, styles.btnSecondary]}
+              onPress={() => suggestAnother(SLOTS[idx] || 'Meal', idx)}
+              onLongPress={() => openDirectedSuggest(SLOTS[idx] || 'Meal', idx)}
+              delayLongPress={450}
+            >
               <Text style={styles.btnText}>Suggest Something Else</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.checkbox} onPress={() => toggleEaten(idx)}>
@@ -380,6 +522,30 @@ export default function HomeScreen() {
           </View>
         </View>
       </Modal>
+
+      <Modal visible={directionModal} transparent animationType="fade">
+        <View style={styles.modalWrap}>
+          <View style={styles.modalCard}>
+            <Text style={styles.h2}>What would you like?</Text>
+            <TextInput
+              style={[styles.input, { height: 100 }]}
+              value={directionText}
+              onChangeText={setDirectionText}
+              placeholder="Example: something spicy, no paneer, more protein..."
+              placeholderTextColor="#9CA3AF"
+              multiline
+            />
+            <View style={{ height: 8 }} />
+            <TouchableOpacity style={styles.cta} onPress={submitDirectedSuggest}>
+              <Text style={styles.ctaText}>Submit</Text>
+            </TouchableOpacity>
+            <View style={{ height: 8 }} />
+            <TouchableOpacity style={[styles.cta, { backgroundColor: '#EF4444' }]} onPress={() => setDirectionModal(false)}>
+              <Text style={styles.ctaText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
@@ -389,6 +555,8 @@ const styles = StyleSheet.create({
   h2: { fontSize: 18, fontWeight: '600', marginVertical: 8, color: '#E6EAF2' },
   card: { backgroundColor: '#141A22', borderRadius: 14, padding: 14, marginVertical: 8, borderWidth: 1, borderColor: '#1F2937' },
   cardImage: { width: '100%', height: 140, borderRadius: 10, marginBottom: 10 },
+  cardImageFallback: { backgroundColor: '#1F2937', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 16 },
+  cardImageFallbackText: { color: '#C7D2FE', fontWeight: '700', textAlign: 'center' },
   badge: { alignSelf: 'flex-start', backgroundColor: '#1F2937', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, marginBottom: 6, borderWidth: 1, borderColor: '#334155' },
   badgeText: { color: '#C7D2FE', fontWeight: '700', fontSize: 12, letterSpacing: 0.3 },
   title: { fontSize: 16, fontWeight: '600', color: '#F3F4F6' },

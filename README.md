@@ -67,7 +67,6 @@ The profile screen enables users to set personal health metrics, dietary prefere
 ### Backend (FastAPI)
 - **FastAPI** - Modern Python web framework
 - **Google Gemini 2.5 Flash** - AI-powered meal generation
-- **Portia AI** - Human-in-the-loop clarification system
 - **Pydantic** - Data validation and serialization
 - **APScheduler** - Automated daily meal planning
 
@@ -119,7 +118,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 3. Install Python dependencies:
 ```bash
-pip install fastapi uvicorn google-generativeai portia python-dotenv requests apscheduler python-multipart
+pip install fastapi uvicorn google-generativeai python-dotenv requests apscheduler python-multipart pydantic
 ```
 
 4. Create environment file:
@@ -210,7 +209,6 @@ The application includes configurable feature flags in `src/config/api.js`:
 - `AI_MEAL_RECOMMENDATIONS` - Enable AI-powered meal suggestions
 - `MEAL_IMAGES` - Enable automatic meal image generation
 - `CALENDAR_INTEGRATION` - Enable calendar integration
-- `PORTIA_AI` - Enable Portia AI features
 - `ANALYTICS` - Enable advanced analytics
 
 ### Environment Variables
