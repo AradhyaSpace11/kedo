@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { View, Text, Alert, TextInput, FlatList, Modal, StyleSheet, TouchableOpacity, ActivityIndicator, Animated, Easing } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 import { get, post } from '../lib/api';
 
 const DEFAULT_KETO_PANTRY = [
@@ -25,13 +26,13 @@ const DEFAULT_KETO_PANTRY = [
   { name: 'Coriander', quantity: '1 bunch' },
   { name: 'Green chilli', quantity: '6' },
   { name: 'Ginger', quantity: '100 g' },
-  { name: 'Garlic', quantity: '2 bulbs' },
-  { name: 'Salt', quantity: '1 jar' },
-  { name: 'Black pepper', quantity: '1 jar' },
-  { name: 'Turmeric', quantity: '1 jar' },
-  { name: 'Cumin', quantity: '1 jar' },
-  { name: 'Garam masala', quantity: '1 jar' },
-  { name: 'Red chilli powder', quantity: '1 jar' },
+  { name: 'Garlic', quantity: '100 g' },
+  { name: 'Salt', quantity: '500 g' },
+  { name: 'Black pepper', quantity: '100 g' },
+  { name: 'Turmeric', quantity: '100 g' },
+  { name: 'Cumin', quantity: '100 g' },
+  { name: 'Garam masala', quantity: '100 g' },
+  { name: 'Red chilli powder', quantity: '100 g' },
 ];
 
 export default function PantryScreen({ navigation }) {
@@ -53,16 +54,20 @@ export default function PantryScreen({ navigation }) {
     return () => loop.stop();
   }, [generating, pulse]);
 
-  React.useEffect(() => {
-    (async () => {
-      try {
-        const res = await get('/pantry');
-        if (Array.isArray(res?.pantry?.items) && res.pantry.items.length) {
-          setItems(res.pantry.items);
-        }
-      } catch {}
-    })();
+  const loadPantry = React.useCallback(async () => {
+    try {
+      const res = await get('/pantry');
+      if (Array.isArray(res?.pantry?.items) && res.pantry.items.length) {
+        setItems(res.pantry.items);
+      }
+    } catch {}
   }, []);
+
+  useFocusEffect(
+    React.useCallback(() => {
+      loadPantry();
+    }, [loadPantry])
+  );
 
   function updateQty(index, val) {
     const copy = [...items];

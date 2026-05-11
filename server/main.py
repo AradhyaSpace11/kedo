@@ -1,12 +1,18 @@
-from fastapi import FastAPI, Form, UploadFile, File, Request
+from fastapi import FastAPI, Form, UploadFile, File, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os, json
 from datetime import datetime, date
 from pathlib import Path
+import math
 import re
 import hashlib
+import random
+import struct
+import urllib.request
+import zlib
+from functools import lru_cache
 from urllib.parse import quote
 
 # ---------- load .env ----------
@@ -109,13 +115,13 @@ DEFAULT_PANTRY = Pantry(items=[
     PantryItem(name="Coriander", quantity="1 bunch"),
     PantryItem(name="Green chilli", quantity="6"),
     PantryItem(name="Ginger", quantity="100 g"),
-    PantryItem(name="Garlic", quantity="2 bulbs"),
-    PantryItem(name="Salt", quantity="1 jar"),
-    PantryItem(name="Black pepper", quantity="1 jar"),
-    PantryItem(name="Turmeric", quantity="1 jar"),
-    PantryItem(name="Cumin", quantity="1 jar"),
-    PantryItem(name="Garam masala", quantity="1 jar"),
-    PantryItem(name="Red chilli powder", quantity="1 jar"),
+    PantryItem(name="Garlic", quantity="100 g"),
+    PantryItem(name="Salt", quantity="500 g"),
+    PantryItem(name="Black pepper", quantity="100 g"),
+    PantryItem(name="Turmeric", quantity="100 g"),
+    PantryItem(name="Cumin", quantity="100 g"),
+    PantryItem(name="Garam masala", quantity="100 g"),
+    PantryItem(name="Red chilli powder", quantity="100 g"),
 ])
 
 STATE: Dict[str, Any] = {"profile": DEFAULT_PROFILE, "pantry": DEFAULT_PANTRY}
@@ -298,11 +304,170 @@ def _generated_food_image_url(query: str) -> str:
     clean = re.sub(r"\s+", " ", str(query or "simple keto meal")).strip()
     prompt = (
         f"realistic food photo of {clean}, Indian keto home cooking, "
-        "single plated dish, natural light, clearly showing the meal, no text"
+        "single plated dish, natural light, no text"
     )
     seed = _stable_seed(clean) % 2147483647
     encoded = quote(prompt, safe="")
-    return f"https://image.pollinations.ai/prompt/{encoded}?width=900&height=600&model=flux&seed={seed}&safe=true"
+    return f"https://image.pollinations.ai/prompt/{encoded}?width=512&height=384&model=turbo&seed={seed}&enhance=false&private=true&safe=true"
+
+REAL_FOOD_PHOTO_FALLBACKS = [
+    (
+        ("palak", "paneer", "spinach", "bhurji"),
+        [
+            "https://images.unsplash.com/photo-1565557623262-b51c2513a641a?auto=format&fit=crop&w=900&q=80",
+            "https://images.unsplash.com/photo-1585937421612-70a008356fbe?auto=format&fit=crop&w=900&q=80",
+            "https://images.unsplash.com/photo-1606491956689-2ea866880c84?auto=format&fit=crop&w=900&q=80",
+        ],
+    ),
+    (
+        ("chicken", "curry", "coconut", "masala"),
+        [
+            "https://images.unsplash.com/photo-1603894584373-5ac82b2ae398?auto=format&fit=crop&w=900&q=80",
+            "https://images.unsplash.com/photo-1565557623262-b51c2513a641a?auto=format&fit=crop&w=900&q=80",
+            "https://images.unsplash.com/photo-1585937421612-70a008356fbe?auto=format&fit=crop&w=900&q=80",
+        ],
+    ),
+    (
+        ("egg", "omelette", "breakfast"),
+        [
+            "https://images.unsplash.com/photo-1525351484163-7529414344d8?auto=format&fit=crop&w=900&q=80",
+            "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=900&q=80",
+        ],
+    ),
+    (
+        ("fish", "salmon"),
+        [
+            "https://images.unsplash.com/photo-1467003909585-2f8a72700288?auto=format&fit=crop&w=900&q=80",
+            "https://images.unsplash.com/photo-1485921325833-c519f76c4927?auto=format&fit=crop&w=900&q=80",
+        ],
+    ),
+]
+
+GENERIC_REAL_FOOD_PHOTOS = [
+    "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?auto=format&fit=crop&w=900&q=80",
+    "https://images.unsplash.com/photo-1512621776951-a57141f2eefd?auto=format&fit=crop&w=900&q=80",
+    "https://images.unsplash.com/photo-1490645935967-10de6ba17061?auto=format&fit=crop&w=900&q=80",
+    "https://images.unsplash.com/photo-1512058564366-18510be2db19?auto=format&fit=crop&w=900&q=80",
+    "https://images.unsplash.com/photo-1504674900247-0877df9cc836?auto=format&fit=crop&w=900&q=80",
+]
+
+def _real_food_photo_urls(query: str) -> List[str]:
+    key = _canonical_name(query)
+    selected: List[str] = []
+    for words, urls in REAL_FOOD_PHOTO_FALLBACKS:
+        if any(word in key for word in words):
+            selected.extend(urls)
+
+    specific = list(dict.fromkeys(selected))
+    generic = [url for url in GENERIC_REAL_FOOD_PHOTOS if url not in specific]
+    if specific:
+        offset = _stable_seed(query or "simple keto meal") % len(specific)
+        specific = specific[offset:] + specific[:offset]
+    return specific + generic
+
+def _fetch_image_url(url: str, timeout: float) -> Optional[tuple]:
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Kedo/1.0",
+                "Accept": "image/jpeg,image/png,image/webp,*/*;q=0.8",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            media_type = (resp.headers.get("content-type") or "").split(";", 1)[0].lower()
+            data = resp.read(4_000_001)
+            if media_type in {"image/jpeg", "image/jpg", "image/png", "image/webp"} and 1024 < len(data) <= 4_000_000:
+                return data, media_type
+    except Exception:
+        pass
+    return None
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + kind
+        + data
+        + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    )
+
+def _encode_rgb_png(width: int, height: int, rows: List[bytearray]) -> bytes:
+    raw = b"".join(b"\x00" + bytes(row) for row in rows)
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(raw, 6))
+        + _png_chunk(b"IEND", b"")
+    )
+
+def _blend(a: int, b: int, t: float) -> int:
+    return max(0, min(255, int(a + (b - a) * t)))
+
+def _blend_rgb(a: tuple, b: tuple, t: float) -> tuple:
+    return tuple(_blend(a[i], b[i], t) for i in range(3))
+
+def _meal_placeholder_png(query: str) -> bytes:
+    width, height = 512, 384
+    seed = _stable_seed(query or "simple keto meal")
+    rng = random.Random(seed)
+    palettes = [
+        ((20, 30, 44), (38, 54, 70), (238, 233, 217), [(45, 133, 83), (235, 177, 71), (218, 90, 68), (244, 231, 176)]),
+        ((18, 33, 30), (54, 72, 58), (241, 237, 223), [(236, 164, 59), (91, 147, 87), (239, 214, 146), (194, 75, 62)]),
+        ((26, 28, 45), (58, 54, 86), (236, 229, 211), [(228, 116, 73), (248, 201, 104), (76, 141, 91), (230, 230, 205)]),
+    ]
+    bg_a, bg_b, plate, food_colors = palettes[seed % len(palettes)]
+    blobs = []
+    for idx in range(14):
+        angle = rng.random() * 6.28318
+        radius = rng.uniform(0, 82)
+        cx = 256 + int(radius * rng.uniform(0.65, 1.0) * math.cos(angle))
+        cy = 202 + int(radius * rng.uniform(0.35, 0.75) * math.sin(angle))
+        rx = rng.randint(22, 54)
+        ry = rng.randint(12, 34)
+        color = food_colors[(idx + seed) % len(food_colors)]
+        blobs.append((cx, cy, rx, ry, color))
+
+    rows: List[bytearray] = []
+    for y in range(height):
+        row = bytearray()
+        t = y / max(1, height - 1)
+        base = _blend_rgb(bg_a, bg_b, t)
+        for x in range(width):
+            color = base
+            dx = (x - 256) / 190
+            dy = (y - 205) / 118
+            plate_distance = dx * dx + dy * dy
+            if plate_distance <= 1:
+                shade = min(1, plate_distance)
+                color = _blend_rgb(plate, (200, 194, 178), shade * 0.35)
+            if plate_distance <= 0.72:
+                color = _blend_rgb(color, (246, 241, 226), 0.35)
+            for cx, cy, rx, ry, blob_color in blobs:
+                bx = (x - cx) / rx
+                by = (y - cy) / ry
+                if bx * bx + by * by <= 1:
+                    color = _blend_rgb(color, blob_color, 0.86)
+            if ((x - 198) / 42) ** 2 + ((y - 152) / 12) ** 2 <= 1:
+                color = _blend_rgb(color, (255, 255, 255), 0.26)
+            row.extend(color)
+        rows.append(row)
+    return _encode_rgb_png(width, height, rows)
+
+def _fetch_generated_food_image(query: str) -> Optional[tuple]:
+    return _fetch_image_url(_generated_food_image_url(query), timeout=12.0)
+
+@lru_cache(maxsize=96)
+def _meal_image_bytes(query: str) -> tuple:
+    clean = re.sub(r"\s+", " ", str(query or "simple keto meal")).strip()
+    generated = _fetch_generated_food_image(clean)
+    if generated:
+        return generated
+    for url in _real_food_photo_urls(clean)[:4]:
+        photo = _fetch_image_url(url, timeout=5.0)
+        if photo:
+            return photo
+    return _meal_placeholder_png(clean), "image/png"
 
 def _is_renderable_image_url(url: Any) -> bool:
     return (
@@ -313,8 +478,9 @@ def _is_renderable_image_url(url: Any) -> bool:
     )
 
 def _ensure_image_url(dish_name: Optional[str], current: Optional[str]) -> Optional[str]:
-    """Return a keyless generated food image URL tied to this exact dish."""
-    """Return a usable image URL; try current → Pixabay → Unsplash placeholder."""
+    """Return a usable image URL, preserving supplied direct image URLs."""
+    if _is_renderable_image_url(current):
+        return current
     q = (dish_name or "meal").strip()
     return _generated_food_image_url(q)
 
@@ -407,6 +573,189 @@ def _pick_pantry_item(pantry: Pantry, candidates: List[str]) -> Optional[str]:
                 return pantry_name
     return None
 
+def _find_pantry_item(pantry: Optional[Pantry], name: str) -> Optional[PantryItem]:
+    if not pantry:
+        return None
+    for item in pantry.items:
+        if _name_matches_pantry(name, [item.name]):
+            return item
+    return None
+
+def _parse_amount(raw: str) -> Optional[float]:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    if "/" in value and value.count("/") == 1:
+        left, right = value.split("/", 1)
+        try:
+            denom = float(right)
+            return float(left) / denom if denom else None
+        except ValueError:
+            return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+def _normalize_quantity_unit(unit: str) -> str:
+    unit = re.sub(r"[^a-zA-Z]+", "", str(unit or "").lower())
+    aliases = {
+        "": "count", "pc": "count", "pcs": "count", "piece": "count", "pieces": "count",
+        "egg": "count", "eggs": "count", "g": "g", "gm": "g", "gms": "g", "gram": "g", "grams": "g",
+        "kg": "kg", "kilogram": "kg", "kilograms": "kg", "ml": "ml", "milliliter": "ml", "milliliters": "ml",
+        "l": "l", "liter": "l", "liters": "l", "litre": "l", "litres": "l",
+        "tsp": "tsp", "teaspoon": "tsp", "teaspoons": "tsp", "tbsp": "tbsp", "tablespoon": "tbsp", "tablespoons": "tbsp",
+        "bunch": "bunch", "bunches": "bunch", "head": "head", "heads": "head",
+        "bulb": "bulb", "bulbs": "bulb", "clove": "clove", "cloves": "clove",
+        "jar": "jar", "jars": "jar",
+    }
+    return aliases.get(unit, unit or "count")
+
+def _parse_quantity(value: str) -> Optional[Dict[str, Any]]:
+    text = str(value or "").strip().lower()
+    if not text or text in {"as available", "as needed", "to taste", "some"}:
+        return None
+    match = re.search(r"(\d+/\d+|\d+(?:\.\d+)?)\s*([a-zA-Z]*)", text)
+    if not match:
+        return None
+    amount = _parse_amount(match.group(1))
+    if amount is None:
+        return None
+    return {"amount": amount, "unit": _normalize_quantity_unit(match.group(2))}
+
+def _base_quantity(amount: float, unit: str, prefer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    unit = _normalize_quantity_unit(unit)
+    prefer = _normalize_quantity_unit(prefer or "")
+    if unit == "kg":
+        return {"amount": amount * 1000, "unit": "g"}
+    if unit == "g":
+        return {"amount": amount, "unit": "g"}
+    if unit == "l":
+        return {"amount": amount * 1000, "unit": "ml"}
+    if unit == "ml":
+        return {"amount": amount, "unit": "ml"}
+    if unit == "tsp":
+        return {"amount": amount * 5, "unit": "g" if prefer == "g" else "ml"}
+    if unit == "tbsp":
+        return {"amount": amount * 15, "unit": "g" if prefer == "g" else "ml"}
+    if unit == "clove" and prefer == "bulb":
+        return {"amount": amount / 10, "unit": "bulb"}
+    if unit == "jar" and prefer == "g":
+        return {"amount": amount * 100, "unit": "g"}
+    return {"amount": amount, "unit": unit}
+
+def _format_quantity(amount: float, unit: str) -> str:
+    if amount <= 0:
+        amount = 0
+    if abs(amount - round(amount)) < 0.001:
+        number = str(int(round(amount)))
+    else:
+        number = f"{amount:.2f}".rstrip("0").rstrip(".")
+    unit = _normalize_quantity_unit(unit)
+    if unit == "count":
+        return number
+    if unit in {"g", "ml", "kg", "l", "tsp", "tbsp"}:
+        return f"{number} {unit}"
+    plural = "" if abs(amount - 1) < 0.001 else "s"
+    if unit == "bunch":
+        return f"{number} bunch{'' if abs(amount - 1) < 0.001 else 'es'}"
+    return f"{number} {unit}{plural}"
+
+SERVING_QUANTITIES = [
+    ("coconut oil", "10 ml"), ("coconut milk", "120 ml"), ("fresh cream", "50 ml"),
+    ("red chilli powder", "2 g"), ("garam masala", "2 g"), ("black pepper", "1 g"),
+    ("green chilli", "1"), ("chicken breast", "180 g"), ("fish fillet", "180 g"),
+    ("greek yogurt", "150 g"), ("bell pepper", "1"), ("cauliflower", "0.5 head"),
+    ("mushroom", "100 g"), ("coriander", "0.25 bunch"), ("spinach", "1 bunch"),
+    ("paneer", "120 g"), ("egg", "2"), ("cheese", "40 g"), ("ghee", "10 g"),
+    ("cucumber", "0.5"), ("avocado", "0.5"), ("almond", "30 g"), ("walnut", "30 g"),
+    ("lemon", "0.5"), ("ginger", "10 g"), ("garlic", "10 g"), ("salt", "2 g"),
+    ("turmeric", "2 g"), ("cumin", "2 g"),
+]
+
+def _default_serving_quantity(name: str) -> str:
+    key = _canonical_name(name)
+    for token, quantity in SERVING_QUANTITIES:
+        if token in key:
+            return quantity
+    return "1"
+
+def _cap_to_available(requested: str, available: str) -> str:
+    req = _parse_quantity(requested)
+    avail = _parse_quantity(available)
+    if not req or not avail:
+        return requested
+    req_base = _base_quantity(req["amount"], req["unit"], avail["unit"])
+    avail_base = _base_quantity(avail["amount"], avail["unit"], req["unit"])
+    if not req_base or not avail_base or req_base["unit"] != avail_base["unit"]:
+        return requested
+    if req_base["amount"] <= avail_base["amount"]:
+        return requested
+    return _format_quantity(avail["amount"], avail["unit"])
+
+def _serving_quantity_for_item(name: str, pantry: Optional[Pantry]) -> str:
+    quantity = _default_serving_quantity(name)
+    pantry_item = _find_pantry_item(pantry, name)
+    if pantry_item:
+        quantity = _cap_to_available(quantity, pantry_item.quantity)
+    return quantity
+
+def _needs_specific_quantity(quantity: str) -> bool:
+    text = str(quantity or "").strip().lower()
+    return not text or text in {"as available", "as needed", "to taste", "some"}
+
+def _ensure_meal_quantities(meal: Dict[str, Any], pantry: Optional[Pantry]) -> Dict[str, Any]:
+    ingredients = meal.get("ingredients") or []
+    for ingredient in ingredients:
+        if not isinstance(ingredient, dict):
+            continue
+        item_name = str(ingredient.get("item", ""))
+        if _needs_specific_quantity(ingredient.get("quantity", "")):
+            ingredient["quantity"] = _serving_quantity_for_item(item_name, pantry)
+            continue
+        pantry_item = _find_pantry_item(pantry, item_name)
+        if pantry_item:
+            ingredient["quantity"] = _cap_to_available(str(ingredient.get("quantity", "")), pantry_item.quantity)
+    meal["ingredients"] = ingredients
+    return meal
+
+def _subtract_quantity(available: str, used: str) -> Optional[str]:
+    current = _parse_quantity(available)
+    deduction = _parse_quantity(used)
+    if not current or not deduction:
+        return available
+    current_base = _base_quantity(current["amount"], current["unit"], deduction["unit"])
+    deduction_base = _base_quantity(deduction["amount"], deduction["unit"], current["unit"])
+    if not current_base or not deduction_base or current_base["unit"] != deduction_base["unit"]:
+        return available
+    remaining_base = max(0, current_base["amount"] - deduction_base["amount"])
+    if remaining_base <= 0.0001:
+        return None
+    if current_base["unit"] == current["unit"]:
+        return _format_quantity(remaining_base, current["unit"])
+    if current["unit"] == "kg" and current_base["unit"] == "g":
+        return _format_quantity(remaining_base / 1000, "kg")
+    if current["unit"] == "l" and current_base["unit"] == "ml":
+        return _format_quantity(remaining_base / 1000, "l")
+    return _format_quantity(remaining_base, current_base["unit"])
+
+def _deduct_meal_ingredients_from_pantry(meal: Meal, pantry: Optional[Pantry]) -> Dict[str, Any]:
+    if not pantry:
+        return {"pantry": Pantry(items=[]), "deducted": []}
+    deducted: List[Dict[str, str]] = []
+    remaining: List[PantryItem] = []
+    meal_ingredients = list(meal.ingredients or [])
+    for pantry_item in pantry.items:
+        match = next((ingredient for ingredient in meal_ingredients if _name_matches_pantry(ingredient.item, [pantry_item.name])), None)
+        if not match:
+            remaining.append(pantry_item)
+            continue
+        new_quantity = _subtract_quantity(pantry_item.quantity, match.quantity)
+        deducted.append({"item": pantry_item.name, "used": match.quantity, "before": pantry_item.quantity, "after": new_quantity or "0"})
+        if new_quantity:
+            remaining.append(PantryItem(name=pantry_item.name, quantity=new_quantity))
+    return {"pantry": Pantry(items=remaining), "deducted": deducted}
+
 def _fallback_pantry_meal(
     pantry: Pantry,
     dish_name: str,
@@ -421,7 +770,7 @@ def _fallback_pantry_meal(
         item = _pick_pantry_item(pantry, group)
         if item and _canonical_name(item) not in used:
             used.add(_canonical_name(item))
-            ingredients.append({"item": item, "quantity": "as available"})
+            ingredients.append({"item": item, "quantity": _serving_quantity_for_item(item, pantry)})
     if require_all_candidates and len(ingredients) < len(candidates):
         return None
     if not ingredients:
@@ -649,6 +998,7 @@ ABSOLUTE RULES:
 - Do NOT add salt, pepper, oil, water, spices, sauces, garnish, or optional ingredients unless that exact item is in the pantry.
 - Do NOT use beef or pork under any circumstance.
 - Prefer Indian keto-style dishes.
+- Use concrete serving quantities for every ingredient, such as "2", "120 g", "10 ml", or "0.5 head". Never use "as available".
 - recipe_steps must only mention the listed meal ingredients and cooking actions.
 - If a normal recipe would need a missing ingredient, choose a simpler dish instead.
 {guidance_text}
@@ -699,6 +1049,7 @@ def _generate_pantry_only_meals(
         raw_meals = _normalize_meal_list(data) if count > 1 else [_normalize_meal(data, slot or "Meal")]
         valid_meals = _filter_pantry_only_meals(raw_meals, pantry)
         for meal in valid_meals:
+            meal = _ensure_meal_quantities(meal, pantry)
             key = _canonical_name(meal.get("dish_name", ""))
             if key and key not in seen:
                 seen.add(key)
@@ -745,6 +1096,15 @@ app.add_middleware(
 )
 
 # ---------- endpoints ----------
+@app.get("/images/meal")
+def meal_image(query: str = "simple keto meal"):
+    data, media_type = _meal_image_bytes(query)
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
 @app.post("/user/profile")
 def upsert_profile(p: UserProfile):
     if not p.meal_times:
@@ -834,6 +1194,10 @@ def meals_recommendations():
 @app.get("/plan/today")
 def get_today_plan():
     plan = STATE.get("plans", {}).get(str(date.today()))
+    if isinstance(plan, list):
+        pantry: Pantry = STATE.get("pantry")
+        plan = [_ensure_meal_quantities(dict(meal), pantry) if isinstance(meal, dict) else meal for meal in plan]
+        STATE.setdefault("plans", {})[str(date.today())] = plan
     return {"date": str(date.today()), "meals": plan}
 
 @app.get("/meals/suggest_another")
@@ -870,19 +1234,9 @@ def recommend_snack(max_calories: int = 300):
 
 @app.post("/meals/log_eaten")
 def log_eaten(meal: Meal):
-    # Naive deduction: remove pantry items that match ingredient names (case-insensitive substring)
     pantry: Pantry = STATE.get("pantry")
-    remaining: List[PantryItem] = []
-    deducted_names: List[str] = []
-    ing_names = [i.item.lower() for i in (meal.ingredients or [])]
-    for it in pantry.items:
-        name_l = it.name.lower()
-        if any(k in name_l or name_l in k for k in ing_names):
-            deducted_names.append(it.name)
-            # skip (deduct)
-        else:
-            remaining.append(it)
-    STATE["pantry"] = Pantry(items=remaining)
+    deduction = _deduct_meal_ingredients_from_pantry(meal, pantry)
+    STATE["pantry"] = deduction["pantry"]
     # maintain daily totals in state
     totals = STATE.setdefault("totals", {str(date.today()): {"protein": 0, "carbs": 0, "fat": 0}})
     day = totals.setdefault(str(date.today()), {"protein": 0, "carbs": 0, "fat": 0})
@@ -891,7 +1245,7 @@ def log_eaten(meal: Meal):
     day["fat"] += float(meal.macros.fat)
     totals[str(date.today())] = day
     STATE["totals"] = totals
-    return {"ok": True, "deducted": deducted_names, "macros": meal.macros, "totals": day, "pantry": STATE["pantry"]}
+    return {"ok": True, "deducted": deduction["deducted"], "macros": meal.macros, "totals": day, "pantry": STATE["pantry"]}
 
 @app.post("/meals/log_custom")
 def log_custom(food: CustomFood):

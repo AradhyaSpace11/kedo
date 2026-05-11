@@ -3,25 +3,14 @@ import { View, Text, Alert, Modal, TextInput, ScrollView, TouchableOpacity, Styl
 import * as Calendar from 'expo-calendar';
 import { useFocusEffect } from '@react-navigation/native';
 import BarChart from '../components/BarChart';
-import { get, post } from '../lib/api';
+import { API, get, post } from '../lib/api';
 import { FEATURE_FLAGS } from '../config/api';
 
 const e = (s) => (s == null ? '' : String(s));
 
-const stableSeed = (value) => {
-  let hash = 2166136261;
-  const text = String(value || 'simple keto meal');
-  for (let i = 0; i < text.length; i += 1) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-};
-
 const generatedFoodImageUrl = (query) => {
   const clean = String(query || 'simple keto meal').replace(/\s+/g, ' ').trim();
-  const prompt = `realistic food photo of ${clean}, Indian keto home cooking, single plated dish, natural light, clearly showing the meal, no text`;
-  return `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=900&height=600&model=flux&seed=${stableSeed(clean)}&safe=true`;
+  return `${API}/images/meal?query=${encodeURIComponent(clean)}&v=photo-fallback-2`;
 };
 
 const imagePromptForMeal = (meal) => {
@@ -31,23 +20,19 @@ const imagePromptForMeal = (meal) => {
   return `${meal?.dish_name || 'simple keto meal'} ${ingredients}`.trim();
 };
 
-const isRenderableImageUrl = (url) => (
-  typeof url === 'string'
-  && /^https?:\/\//i.test(url)
-  && !url.includes('source.unsplash.com')
-  && !url.includes('unsplash.com/photos')
-);
-const isGeneratedFoodImageUrl = (url) => (
-  typeof url === 'string'
-  && (url.includes('gen.pollinations.ai/image/') || url.includes('image.pollinations.ai/prompt/'))
-);
-
 function withRenderableImage(meal) {
-  const existing = isRenderableImageUrl(meal?.image) && isGeneratedFoodImageUrl(meal.image) ? meal.image : null;
   return {
     ...meal,
-    image: existing || generatedFoodImageUrl(imagePromptForMeal(meal)),
+    image: generatedFoodImageUrl(imagePromptForMeal(meal)),
+    _imageReady: false,
+    _imageFailed: false,
   };
+}
+
+function prefetchMealImages(items) {
+  (items || []).forEach((meal) => {
+    if (meal?.image) Image.prefetch(meal.image).catch(() => {});
+  });
 }
 
 const DUMMY_MEALS = [
@@ -145,7 +130,9 @@ export default function HomeScreen() {
       setNotice('');
       const plan = await get('/plan/today');
       if (Array.isArray(plan?.meals) && plan.meals.length === 3) {
-        setMeals(plan.meals.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' })));
+        const nextMeals = plan.meals.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' }));
+        prefetchMealImages(nextMeals);
+        setMeals(nextMeals);
         return;
       }
       const r = await get('/meals/recommendations');
@@ -153,12 +140,16 @@ export default function HomeScreen() {
       if (r.state === 'NEED_PANTRY') { setNotice(r.message || 'Add pantry items before requesting meals.'); setMeals([]); return; }
       if (r.state === 'LLM_ERROR' || r.error) {
         const partial = Array.isArray(r.meals) ? r.meals : [];
-        setMeals(partial.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' })));
+        const nextMeals = partial.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' }));
+        prefetchMealImages(nextMeals);
+        setMeals(nextMeals);
         setNotice(partial.length ? 'Showing the pantry-only meals available from this pantry.' : 'Could not make pantry-only recommendations from the current pantry.');
         return;
       }
       const arr = Array.isArray(r.meals) ? r.meals : [];
-      setMeals(arr.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' })));
+      const nextMeals = arr.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' }));
+      prefetchMealImages(nextMeals);
+      setMeals(nextMeals);
     } catch (e) {
       setNotice('Could not reach the meal server.');
       setMeals([]);
@@ -194,30 +185,41 @@ export default function HomeScreen() {
     fetchMacros();
   }, []);
 
-  async function onEaten(m) {
-    setTotals(t => ({
-      protein: t.protein + (m.macros?.protein || 0),
-      carbs: t.carbs + (m.macros?.carbs || 0),
-      fat: t.fat + (m.macros?.fat || 0),
-    }));
-    try {
-      const r = await post('/meals/log_eaten', m);
-      if (r?.totals) setTotals(r.totals);
-    } catch (error) {
-      Alert.alert('Could not log meal', error.message);
-    }
-  }
-  function toggleEaten(idx) {
+  async function toggleEaten(idx) {
+    const meal = meals?.[idx];
+    if (!meal || meal._eaten || meal._logging) return;
     setMeals(old => {
-      if (!old) return old;
+      if (!old?.[idx]) return old;
       const copy = [...old];
-      const curr = { ...(copy[idx] || {}) };
-      const nextVal = !curr._eaten;
-      curr._eaten = nextVal;
-      copy[idx] = curr;
-      if (nextVal) { onEaten(curr); }
+      copy[idx] = { ...copy[idx], _logging: true };
       return copy;
     });
+    try {
+      const payload = {
+        dish_name: meal.dish_name || 'Meal',
+        image: meal.image || null,
+        macros: meal.macros || { protein: 0, carbs: 0, fat: 0 },
+        ingredients: Array.isArray(meal.ingredients) ? meal.ingredients : [],
+        recipe_steps: Array.isArray(meal.recipe_steps) ? meal.recipe_steps : [],
+        video_link: meal.video_link || null,
+      };
+      const r = await post('/meals/log_eaten', payload);
+      if (r?.totals) setTotals(r.totals);
+      setMeals(old => {
+        if (!old?.[idx]) return old;
+        const copy = [...old];
+        copy[idx] = { ...copy[idx], _eaten: true, _logging: false };
+        return copy;
+      });
+    } catch (error) {
+      setMeals(old => {
+        if (!old?.[idx]) return old;
+        const copy = [...old];
+        copy[idx] = { ...copy[idx], _logging: false };
+        return copy;
+      });
+      Alert.alert('Could not log meal', error.message);
+    }
   }
   async function suggestAnother(slot, idx, guidance = '') {
     setMeals(old => { if (!old) return old; const copy = [...old]; copy[idx] = { ...(copy[idx]||{}), _loading: true }; return copy; });
@@ -243,6 +245,7 @@ export default function HomeScreen() {
       _slot: SLOTS[idx] || oneRaw._slot || 'Meal',
       _loading: false,
     }, SLOTS[idx] || 'Meal');
+    prefetchMealImages([one]);
     setMeals(old => { if (!old) return old; const copy = [...old]; copy[idx] = one; return copy; });
   }
 
@@ -353,23 +356,32 @@ export default function HomeScreen() {
       _slot: 'Snack',
       _loading: false,
     }, 'Snack');
+    prefetchMealImages([withSlot]);
     setMeals(old => { if (!old) return [withSlot]; const copy = [...old]; copy[copy.length - 1] = withSlot; return copy; });
   }
+
+  const currentCalories = Math.round(
+    (+totals.protein || 0) * 4
+    + (+totals.carbs || 0) * 4
+    + (+totals.fat || 0) * 9
+  );
 
   return (
     <ScrollView contentContainerStyle={{ padding: 16, backgroundColor: '#0B1117' }}>
       <Text style={styles.h1}>Daily Macros</Text>
       {!!targets?.calories && (
         <Text style={{ color: '#9CA3AF', marginBottom: 6 }}>
-          {Math.round((totals.protein*4 + totals.carbs*4 + totals.fat*9))}/{Math.round(targets.calories)} kcal
+          {currentCalories}/{Math.round(targets.calories)} kcal
         </Text>
       )}
       <BarChart
         values={[
-          { label: 'Protein', value: totals.protein },
-          { label: 'Carbs', value: totals.carbs },
-          { label: 'Fat', value: totals.fat },
+          { label: 'Protein', value: totals.protein, target: targets.protein },
+          { label: 'Carbs', value: totals.carbs, target: targets.carbs },
+          { label: 'Fat', value: totals.fat, target: targets.fat },
         ]}
+        calories={currentCalories}
+        calorieTarget={targets.calories}
         barColors={{ Protein: '#10B981', Carbs: '#EF4444', Fat: '#F59E0B', protein: '#10B981', carbs: '#EF4444', fat: '#F59E0B' }}
         trackColor="#1F2937"
         textColor="#E6EAF2"
@@ -402,28 +414,45 @@ export default function HomeScreen() {
 
       {meals && meals.filter(Boolean).map((m, idx) => (
         <CardContainer key={idx} loading={!!m._loading}>
-          {m.image ? (
-            <Image
-              source={{ uri: m.image }}
-              style={styles.cardImage}
-              resizeMode="cover"
-              onError={() => {
-                setMeals(old => {
-                  if (!old?.[idx]) return old;
-                  const copy = [...old];
-                  const current = copy[idx];
-                  copy[idx] = isGeneratedFoodImageUrl(current.image)
-                    ? { ...current, image: null, _imageFailed: true }
-                    : { ...current, image: generatedFoodImageUrl(imagePromptForMeal(current)) };
-                  return copy;
-                });
-              }}
-            />
-          ) : (
-            <View style={[styles.cardImage, styles.cardImageFallback]}>
+          <View style={styles.cardImage}>
+            <View style={[StyleSheet.absoluteFillObject, styles.cardImageFallback]}>
               <Text style={styles.cardImageFallbackText}>{m.dish_name || 'Keto meal'}</Text>
+              {!m._imageFailed && <Text style={styles.cardImageHint}>Loading image...</Text>}
             </View>
-          )}
+            {!!m.image && !m._imageFailed && (
+              <Image
+                key={m.image}
+                source={{ uri: m.image }}
+                style={[styles.cardImageLayer, !m._imageReady && styles.cardImageHidden]}
+                resizeMode="cover"
+                onLoadStart={() => {
+                  setMeals(old => {
+                    if (!old?.[idx]) return old;
+                    const copy = [...old];
+                    copy[idx] = { ...copy[idx], _imageReady: false, _imageFailed: false };
+                    return copy;
+                  });
+                }}
+                onLoad={() => {
+                  setMeals(old => {
+                    if (!old?.[idx]) return old;
+                    const copy = [...old];
+                    copy[idx] = { ...copy[idx], _imageReady: true };
+                    return copy;
+                  });
+                }}
+                onError={() => {
+                  setMeals(old => {
+                    if (!old?.[idx]) return old;
+                    const copy = [...old];
+                    const current = copy[idx];
+                    copy[idx] = { ...current, image: null, _imageFailed: true, _imageReady: false };
+                    return copy;
+                  });
+                }}
+              />
+            )}
+          </View>
           {!!m._slot && (
             <View style={styles.badge}><Text style={styles.badgeText}>{m._slot}</Text></View>
           )}
@@ -441,9 +470,13 @@ export default function HomeScreen() {
             >
               <Text style={styles.btnText}>Suggest Something Else</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.checkbox} onPress={() => toggleEaten(idx)}>
+            <TouchableOpacity
+              style={[styles.checkbox, m._eaten && styles.checkboxDone]}
+              onPress={() => toggleEaten(idx)}
+              disabled={!!m._eaten || !!m._logging}
+            >
               <View style={[styles.checkMark, m._eaten && styles.checkOn]} />
-              <Text style={styles.checkLabel}>Ate This!</Text>
+              <Text style={styles.checkLabel}>{m._logging ? 'Logging...' : m._eaten ? 'Logged' : 'Ate This!'}</Text>
             </TouchableOpacity>
           </View>
 
@@ -554,9 +587,12 @@ const styles = StyleSheet.create({
   h1: { fontSize: 22, fontWeight: '700', marginBottom: 8, color: '#E6EAF2' },
   h2: { fontSize: 18, fontWeight: '600', marginVertical: 8, color: '#E6EAF2' },
   card: { backgroundColor: '#141A22', borderRadius: 14, padding: 14, marginVertical: 8, borderWidth: 1, borderColor: '#1F2937' },
-  cardImage: { width: '100%', height: 140, borderRadius: 10, marginBottom: 10 },
+  cardImage: { width: '100%', height: 140, borderRadius: 10, marginBottom: 10, overflow: 'hidden', backgroundColor: '#1F2937' },
+  cardImageLayer: { ...StyleSheet.absoluteFillObject, width: '100%', height: '100%' },
+  cardImageHidden: { opacity: 0 },
   cardImageFallback: { backgroundColor: '#1F2937', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 16 },
   cardImageFallbackText: { color: '#C7D2FE', fontWeight: '700', textAlign: 'center' },
+  cardImageHint: { color: '#94A3B8', fontSize: 12, marginTop: 6 },
   badge: { alignSelf: 'flex-start', backgroundColor: '#1F2937', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, marginBottom: 6, borderWidth: 1, borderColor: '#334155' },
   badgeText: { color: '#C7D2FE', fontWeight: '700', fontSize: 12, letterSpacing: 0.3 },
   title: { fontSize: 16, fontWeight: '600', color: '#F3F4F6' },
@@ -572,6 +608,7 @@ const styles = StyleSheet.create({
   modalCard: { backgroundColor: '#0F172A', padding: 16, borderRadius: 14, width: '90%', borderWidth: 1, borderColor: '#1F2937' },
   input: { borderWidth: 1, borderColor: '#334155', borderRadius: 10, padding: 10, marginTop: 4, color: '#E6EAF2', backgroundColor: '#111827' },
   checkbox: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#141A22', paddingVertical: 8, paddingHorizontal: 10, borderRadius: 10, borderWidth: 1, borderColor: '#1F2937' },
+  checkboxDone: { borderColor: '#10B981' },
   checkMark: { width: 16, height: 16, borderRadius: 4, borderWidth: 2, borderColor: '#334155', marginRight: 8 },
   checkOn: { backgroundColor: '#10B981', borderColor: '#10B981' },
   checkLabel: { color: '#E6EAF2', fontWeight: '600' },
