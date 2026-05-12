@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import { View, Text, Alert, TextInput, FlatList, Modal, StyleSheet, TouchableOpacity, ActivityIndicator, Animated, Easing } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
+import VoiceTextInput from '../components/VoiceTextInput';
 import { get, post } from '../lib/api';
+import { apiMessage } from '../lib/messages';
 
 const DEFAULT_KETO_PANTRY = [
   { name: 'Eggs', quantity: '12' },
@@ -77,7 +79,11 @@ export default function PantryScreen({ navigation }) {
   async function savePantry() {
     try {
       setGenerating(true);
-      await post('/pantry/update', { items });
+      const saved = await post('/pantry/update', { items });
+      if (!saved?.ok) {
+        Alert.alert('Could not save pantry', apiMessage(saved, 'Please keep pantry entries to edible ingredients.'));
+        return;
+      }
       const result = await get('/meals/recommendations');
       if (result?.state !== 'COMPLETE') {
         Alert.alert('Could not generate meals', 'Try adding a few more keto pantry items.');
@@ -85,7 +91,7 @@ export default function PantryScreen({ navigation }) {
       }
       navigation.navigate('Home');
     } catch (error) {
-      Alert.alert('Could not save', error.message);
+      Alert.alert('Could not save', apiMessage(error, 'Please try again.'));
     } finally {
       setGenerating(false);
     }
@@ -95,7 +101,7 @@ export default function PantryScreen({ navigation }) {
     try {
       const data = await post('/pantry/remake', { text: remakeText });
       if (!data?.ok) {
-        Alert.alert('Could not analyze pantry', 'Add a pantry description first.');
+        Alert.alert('Could not analyze pantry', apiMessage(data, 'Add a pantry description with edible ingredients.'));
         return;
       }
       const arr = (data?.pantry?.items || []).map(x => ({ name: x.name, quantity: x.quantity }));
@@ -103,7 +109,7 @@ export default function PantryScreen({ navigation }) {
       setRemakeModal(false);
       setRemakeText('');
     } catch (error) {
-      Alert.alert('Could not analyze pantry', error.message);
+      Alert.alert('Could not analyze pantry', apiMessage(error, 'Please try again.'));
     }
   }
 
@@ -111,7 +117,7 @@ export default function PantryScreen({ navigation }) {
     try {
       const data = await post('/pantry/add', { text: addText });
       if (!data?.ok) {
-        Alert.alert('Could not add items', 'Add a pantry description first.');
+        Alert.alert('Could not add items', apiMessage(data, 'Add pantry items that are edible ingredients.'));
         return;
       }
       const arr = (data?.pantry?.items || []).map(x => ({ name: x.name, quantity: x.quantity }));
@@ -119,7 +125,7 @@ export default function PantryScreen({ navigation }) {
       setAddModal(false);
       setAddText('');
     } catch (error) {
-      Alert.alert('Could not add items', error.message);
+      Alert.alert('Could not add items', apiMessage(error, 'Please try again.'));
     }
   }
 
@@ -148,7 +154,7 @@ export default function PantryScreen({ navigation }) {
         <View style={styles.modalWrap}>
           <View style={styles.modalCard}>
             <Text style={styles.h2}>Add pantry items</Text>
-            <TextInput
+            <VoiceTextInput
               style={[styles.input, { height: 140 }]}
               value={addText}
               onChangeText={setAddText}
@@ -169,7 +175,7 @@ export default function PantryScreen({ navigation }) {
           <View style={styles.modalCard}>
             <Text style={styles.h2}>Describe your pantry/fridge</Text>
             <Text style={{ marginBottom: 8 }}>Use “item: quantity” per line.</Text>
-            <TextInput
+            <VoiceTextInput
               style={[styles.input, { height: 140 }]}
               value={remakeText}
               onChangeText={setRemakeText}

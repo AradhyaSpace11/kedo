@@ -10,6 +10,7 @@ import re
 import hashlib
 import random
 import struct
+import time
 import urllib.request
 import zlib
 from functools import lru_cache
@@ -36,6 +37,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 GEMINI_MODEL = "gemini-2.5-flash"
 _gemini = genai.GenerativeModel(GEMINI_MODEL) if GEMINI_API_KEY else None
+GEMINI_JSON_TIMEOUT_SECONDS = float(os.getenv("GEMINI_JSON_TIMEOUT_SECONDS", "10"))
 
 # ---------- Clarification Model (Replaces Portia) ----------
 class InputClarification(BaseModel):
@@ -84,6 +86,9 @@ class CustomFood(BaseModel):
     free_text: str
 
 # ---------- in-memory state ----------
+DEFAULT_EMAIL = "gaonkararadhya2711@gmail.com"
+DEFAULT_PASSWORD = "World@10"
+
 DEFAULT_PROFILE = UserProfile(
     name="Aradhya Gaonkar", age=21, gender="male",
     height=178.0, weight=72.0, goal="keto style diet",
@@ -124,7 +129,18 @@ DEFAULT_PANTRY = Pantry(items=[
     PantryItem(name="Red chilli powder", quantity="100 g"),
 ])
 
-STATE: Dict[str, Any] = {"profile": DEFAULT_PROFILE, "pantry": DEFAULT_PANTRY}
+WEEKDAY_KEYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+DEFAULT_REMINDERS = {
+    day: {"fasting": False, "breakfast": "08:00", "lunch": "13:00", "dinner": "20:00"}
+    for day in WEEKDAY_KEYS
+}
+
+STATE: Dict[str, Any] = {
+    "auth": {"email": DEFAULT_EMAIL, "logged_in": True},
+    "profile": DEFAULT_PROFILE,
+    "pantry": DEFAULT_PANTRY,
+    "reminders": DEFAULT_REMINDERS.copy(),
+}
 
 # ---------- helpers ----------
 def _extract_text_from_gemini(resp: Any) -> str:
@@ -170,13 +186,16 @@ def _strip_code_fences(s: str) -> str:
         return m.group(1).strip()
     return s
 
-def gemini_json(prompt: str):
+def gemini_json(prompt: str, timeout: Optional[float] = None):
     """Call Gemini, extract text safely, and parse JSON if possible."""
     if not _gemini:
         return {"_error": "gemini_not_configured", "detail": "GEMINI_API_KEY not found in environment variables"}
     
     try:
-        resp = _gemini.generate_content(prompt)
+        resp = _gemini.generate_content(
+            prompt,
+            request_options={"timeout": timeout or GEMINI_JSON_TIMEOUT_SECONDS},
+        )
     except Exception as e:
         return {"_error": "gemini_call_failed", "detail": str(e)}
     text = _extract_text_from_gemini(resp)
@@ -289,6 +308,146 @@ Input:\n{text}
         except Exception:
             pass
     return pantry
+
+GIBBERISH_WORDS = {
+    "blah", "blabla", "blahblah", "asdf", "qwer", "qwerty", "lorem", "ipsum",
+    "gibberish", "random", "nonsense", "test", "testing", "xxx", "yyy", "zzz",
+}
+
+AMBIGUOUS_ITEM_WORDS = {
+    "stuff", "things", "something", "anything", "everything", "nothing", "item",
+    "items", "object", "objects", "material", "materials",
+}
+
+NON_FOOD_TERMS = {
+    "screwdriver", "screwdrivers", "hammer", "hammers", "nail", "nails", "screw",
+    "screws", "bolt", "bolts", "wrench", "wrenches", "plier", "pliers", "drill",
+    "drills", "charger", "chargers", "phone", "phones", "laptop", "laptops",
+    "keyboard", "keyboards", "mouse", "monitor", "monitors", "battery", "batteries",
+    "wire", "wires", "cable", "cables", "remote", "remotes", "book", "books",
+    "pen", "pens", "pencil", "pencils", "shoe", "shoes",
+    "shirt", "shirts", "sock", "socks", "soap", "shampoo", "detergent", "bleach",
+    "paint", "glue", "plastic", "toy", "toys", "stone", "stones", "rock", "rocks",
+    "sand", "wood", "metal", "chair", "chairs", "bed",
+    "beds", "pillow", "pillows", "blanket", "blankets", "car", "cars", "bike",
+    "bikes", "medicine", "medicines", "tablet", "tablets",
+}
+
+GUIDANCE_SIGNAL_WORDS = {
+    "spicy", "mild", "sweet", "savory", "savoury", "crispy", "crunchy", "creamy",
+    "quick", "easy", "light", "heavy", "breakfast", "lunch", "dinner", "snack",
+    "protein", "carb", "carbs", "fat", "calorie", "calories", "keto", "veg",
+    "vegetarian", "nonveg", "chicken", "fish", "egg", "eggs", "paneer", "cheese",
+    "curry", "salad", "bowl", "grilled", "fried", "less", "more", "without",
+    "with", "avoid", "no", "limit", "indian", "asian", "mexican", "italian",
+}
+
+def _validation_error(message: str, invalid_items: Optional[List[str]] = None) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "validation_failed",
+        "message": message,
+        "invalid_items": invalid_items or [],
+    }
+
+def _text_words(value: str) -> List[str]:
+    return re.findall(r"[a-zA-Z]+", str(value or "").lower())
+
+def _looks_like_gibberish(value: str) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    words = _text_words(text)
+    if not text or not words:
+        return True
+    if len(re.sub(r"[^A-Za-z]", "", text)) < 3:
+        return True
+    if re.search(r"(.)\1{5,}", text.lower()):
+        return True
+    if len(words) >= 2 and all(word in GIBBERISH_WORDS for word in words):
+        return True
+    if len(words) >= 3 and len(set(words)) == 1:
+        return True
+    long_words = [word for word in words if len(word) >= 6]
+    if long_words and all(not re.search(r"[aeiou]", word) for word in long_words):
+        return True
+    return False
+
+def _find_non_food_terms(value: str) -> List[str]:
+    words = set(_text_words(value))
+    return sorted(term for term in NON_FOOD_TERMS if term in words)
+
+def _validate_general_text(value: str, label: str) -> Optional[Dict[str, Any]]:
+    text = str(value or "").strip()
+    if not text:
+        return _validation_error(f"Please enter {label}.")
+    if len(text) > 2000:
+        return _validation_error(f"{label.capitalize()} is too long. Please keep it shorter.")
+    if _looks_like_gibberish(text):
+        return _validation_error(f"Please enter meaningful {label}, not random text.")
+    invalid = _find_non_food_terms(text)
+    if invalid:
+        return _validation_error(
+            "This looks like it includes non-edible items. Please enter only food-related information.",
+            invalid,
+        )
+    return None
+
+def _invalid_pantry_item_names(pantry: Pantry) -> List[str]:
+    invalid: List[str] = []
+    for item in pantry.items if pantry else []:
+        name = str(item.name or "").strip()
+        key = _canonical_name(name)
+        if not name or key in AMBIGUOUS_ITEM_WORDS or _looks_like_gibberish(name):
+            invalid.append(name or "blank item")
+            continue
+        if _find_non_food_terms(name):
+            invalid.append(name)
+    return invalid
+
+def _validate_pantry_text(text: str, pantry: Optional[Pantry] = None) -> Optional[Dict[str, Any]]:
+    basic = _validate_general_text(text, "pantry items")
+    if basic:
+        return basic
+    if pantry is not None:
+        if not pantry.items:
+            return _validation_error("I could not find any edible pantry items in that text.")
+        invalid = _invalid_pantry_item_names(pantry)
+        if invalid:
+            return _validation_error(
+                "These do not look like edible pantry items. Please add only ingredients or food.",
+                invalid,
+            )
+    return None
+
+def _validate_guidance_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    clean = str(text or "").strip()
+    if not clean:
+        return None
+    basic = _validate_general_text(clean, "recipe guidance")
+    if basic:
+        return basic
+    words = set(_text_words(clean))
+    pantry_words = set()
+    for pantry_name in _pantry_names(STATE.get("pantry")):
+        pantry_words.update(_text_words(pantry_name))
+    if not (words & GUIDANCE_SIGNAL_WORDS or words & pantry_words):
+        return _validation_error("Please give a clear food preference, ingredient, cuisine, or macro direction.")
+    return None
+
+def _validate_custom_food_text(text: str) -> Optional[Dict[str, Any]]:
+    basic = _validate_general_text(text, "what you ate")
+    if basic:
+        return basic
+    words = set(_text_words(text))
+    if words <= AMBIGUOUS_ITEM_WORDS:
+        return _validation_error("Please describe the food you ate and the quantity.")
+    return None
+
+def _validate_meal_times(meal_times: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    for key in ("breakfast", "lunch", "dinner"):
+        value = str(meal_times.get(key, "")).strip()
+        if not re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", value):
+            return _validation_error("Meal times must be clear 24-hour times like 08:00, 13:00, and 20:00.")
+    return None
 
 COMMON_UNLISTED_INGREDIENTS = [
     "salt", "pepper", "black pepper", "oil", "olive oil", "butter", "ghee",
@@ -529,6 +688,116 @@ def _merge_pantry_items(current: Pantry, additions: Pantry) -> Pantry:
 def _clear_today_plan() -> None:
     STATE.setdefault("plans", {}).pop(str(date.today()), None)
     STATE.setdefault("suggestion_counters", {}).clear()
+
+def _today_key() -> str:
+    return WEEKDAY_KEYS[date.today().weekday()]
+
+def _normalize_reminder_day(value: Any) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    return {
+        "fasting": bool(value.get("fasting", False)),
+        "breakfast": str(value.get("breakfast") or "08:00"),
+        "lunch": str(value.get("lunch") or "13:00"),
+        "dinner": str(value.get("dinner") or "20:00"),
+    }
+
+def _normalize_reminder_schedule(value: Any) -> Dict[str, Dict[str, Any]]:
+    value = value if isinstance(value, dict) else {}
+    return {
+        day: _normalize_reminder_day(value.get(day) or DEFAULT_REMINDERS[day])
+        for day in WEEKDAY_KEYS
+    }
+
+def _validate_reminder_schedule(schedule: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for day in WEEKDAY_KEYS:
+        item = schedule.get(day) or {}
+        validation = _validate_meal_times({
+            "breakfast": str(item.get("breakfast", "")),
+            "lunch": str(item.get("lunch", "")),
+            "dinner": str(item.get("dinner", "")),
+        })
+        if validation:
+            return _validation_error(f"{day.title()} reminders need times like 08:00, 13:00, and 20:00.")
+    return None
+
+def _current_reminders() -> Dict[str, Dict[str, Any]]:
+    reminders = _normalize_reminder_schedule(STATE.get("reminders"))
+    STATE["reminders"] = reminders
+    return reminders
+
+def _today_reminder() -> Dict[str, Any]:
+    return _current_reminders().get(_today_key(), DEFAULT_REMINDERS[_today_key()])
+
+def _is_fasting_today() -> bool:
+    return bool(_today_reminder().get("fasting"))
+
+def _sync_profile_meal_times_from_today() -> None:
+    if _is_fasting_today():
+        return
+    today_reminder = _today_reminder()
+    prof: Optional[UserProfile] = STATE.get("profile")
+    if prof:
+        prof.meal_times = {
+            "breakfast": str(today_reminder.get("breakfast") or "08:00"),
+            "lunch": str(today_reminder.get("lunch") or "13:00"),
+            "dinner": str(today_reminder.get("dinner") or "20:00"),
+        }
+        STATE["profile"] = prof
+
+def _macro_targets_for_profile(profile: Optional[UserProfile], fasting: bool = False) -> Dict[str, float]:
+    if fasting:
+        return {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0, "fasting": True}
+
+    profile = profile or DEFAULT_PROFILE
+    age = max(10.0, _as_float(profile.age, DEFAULT_PROFILE.age))
+    height = max(100.0, _as_float(profile.height, DEFAULT_PROFILE.height))
+    weight = max(30.0, _as_float(profile.weight, DEFAULT_PROFILE.weight))
+    gender = str(profile.gender or "").lower()
+
+    if gender.startswith("f"):
+        bmr = 10 * weight + 6.25 * height - 5 * age - 161
+    elif gender.startswith("m"):
+        bmr = 10 * weight + 6.25 * height - 5 * age + 5
+    else:
+        bmr = 10 * weight + 6.25 * height - 5 * age - 78
+
+    activity_text = str(profile.activity or "").lower()
+    activity_factor = 1.2
+    if "light" in activity_text:
+        activity_factor = 1.375
+    elif "moderate" in activity_text:
+        activity_factor = 1.55
+    elif "very" in activity_text or "athlete" in activity_text:
+        activity_factor = 1.9
+    elif "active" in activity_text or "heavy" in activity_text:
+        activity_factor = 1.725
+
+    calories = bmr * activity_factor
+    goal = " ".join([
+        str(profile.goal or ""),
+        " ".join(profile.restrictions or []),
+    ]).lower()
+    if any(word in goal for word in ["lose", "loss", "cut", "deficit", "fat loss"]):
+        calories *= 0.8
+    elif any(word in goal for word in ["gain", "bulk", "surplus", "muscle"]):
+        calories *= 1.1
+
+    calories = max(1200.0, min(3600.0, calories))
+    keto_mode = "keto" in goal or "low carb" in goal
+    carbs = min(35.0, max(20.0, calories * 0.05 / 4)) if keto_mode else max(80.0, calories * 0.35 / 4)
+    protein = max(weight * 1.4, min(weight * 2.0, calories * 0.25 / 4))
+    fat = max(30.0, (calories - protein * 4 - carbs * 4) / 9)
+
+    def rounded(value: float, step: int = 5) -> float:
+        return float(int(round(value / step) * step))
+
+    return {
+        "calories": rounded(calories, 25),
+        "protein": rounded(protein),
+        "carbs": rounded(carbs),
+        "fat": rounded(fat),
+        "fasting": False,
+    }
 
 def _unavailable_step_ingredients(steps: List[str], pantry_names: List[str]) -> List[str]:
     text = " ".join(steps).lower()
@@ -986,6 +1255,13 @@ def _pantry_only_prompt(
     calories_text = f" Total calories must be <= {max_calories}." if max_calories else ""
     exclude_text = f" Do not repeat these dish names: {', '.join(exclude_dishes)}." if exclude_dishes else ""
     guidance_text = f"\nUser direction for this regeneration: {guidance}" if guidance else ""
+    prescription_context = _prescription_context_text()
+    prescription_text = (
+        "\nPrescription/medical document context for meal planning:\n"
+        f"{prescription_context}\n"
+        "Use this as additional context when choosing meals and macros. Respect visible dietary cautions, conditions, and avoid/limit notes. Do not diagnose or mention unsupported medical claims.\n"
+        if prescription_context else ""
+    )
     shape = "array" if count != 1 else "object"
     count_text = f"Return EXACT JSON array of {count} meals" if count != 1 else "Return ONE JSON meal object"
     return f"""
@@ -1002,6 +1278,7 @@ ABSOLUTE RULES:
 - recipe_steps must only mention the listed meal ingredients and cooking actions.
 - If a normal recipe would need a missing ingredient, choose a simpler dish instead.
 {guidance_text}
+{prescription_text}
 
 Return ONLY the JSON {shape}. No markdown.
 Schema:
@@ -1085,6 +1362,140 @@ async def _read_text_payload(request: Request) -> str:
     except Exception:
         return ""
 
+def _audio_mime_type(upload: UploadFile) -> str:
+    content_type = (upload.content_type or "").split(";", 1)[0].lower()
+    if content_type in {"audio/mp4", "audio/m4a", "audio/aac", "audio/mpeg", "audio/mp3", "audio/wav", "audio/webm"}:
+        return "audio/mp4" if content_type in {"audio/m4a", "audio/aac"} else content_type
+
+    filename = (upload.filename or "").lower()
+    if filename.endswith(".m4a"):
+        return "audio/mp4"
+    if filename.endswith(".aac"):
+        return "audio/aac"
+    if filename.endswith(".mp3"):
+        return "audio/mpeg"
+    if filename.endswith(".wav"):
+        return "audio/wav"
+    if filename.endswith(".webm"):
+        return "audio/webm"
+    return "audio/mp4"
+
+def _image_mime_type(upload: UploadFile) -> str:
+    content_type = (upload.content_type or "").split(";", 1)[0].lower()
+    if content_type in {"image/jpeg", "image/jpg", "image/png", "image/webp"}:
+        return "image/jpeg" if content_type == "image/jpg" else content_type
+
+    filename = (upload.filename or "").lower()
+    if filename.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if filename.endswith(".png"):
+        return "image/png"
+    if filename.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+def _is_supported_image_upload(upload: UploadFile) -> bool:
+    content_type = (upload.content_type or "").split(";", 1)[0].lower()
+    filename = (upload.filename or "").lower()
+    return (
+        content_type in {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+        or filename.endswith((".jpg", ".jpeg", ".png", ".webp"))
+    )
+
+def _wait_for_gemini_file(remote_file: Any) -> Any:
+    for _ in range(12):
+        try:
+            refreshed = genai.get_file(remote_file.name)
+        except Exception:
+            return remote_file
+        state = getattr(refreshed, "state", None)
+        state_name = str(getattr(state, "name", state) or "").upper()
+        if state_name in {"ACTIVE", "2"}:
+            return refreshed
+        if state_name in {"FAILED", "10"}:
+            raise RuntimeError("Audio upload failed before transcription.")
+        time.sleep(0.5)
+    return remote_file
+
+def _prescription_context_text() -> str:
+    docs = STATE.get("user_docs") or {}
+    context = docs.get("prescription_context")
+    if not context:
+        return ""
+    try:
+        return json.dumps(context, ensure_ascii=False)
+    except Exception:
+        return str(context)
+
+def _analyze_prescription_image(path: Path, upload: UploadFile) -> Dict[str, Any]:
+    if not _gemini:
+        return {"is_medical_document": False, "rejection_reason": "Gemini is not configured for prescription analysis."}
+
+    remote_file = None
+    try:
+        remote_file = genai.upload_file(path, mime_type=_image_mime_type(upload))
+        remote_file = _wait_for_gemini_file(remote_file)
+        resp = _gemini.generate_content(
+            [
+                """
+Read this prescription or medical document image and extract only nutrition-relevant context for meal planning.
+Reject drawings, blank images, selfies, food photos, random objects, screenshots without medical content, and unreadable images.
+Do not diagnose. Do not invent details that are not visible. If handwriting is unclear, say so.
+Return ONLY JSON with this schema:
+{
+  "is_medical_document": boolean,
+  "document_type": string|null,
+  "visible_text": string,
+  "health_context": [string],
+  "nutrition_considerations": [string],
+  "avoid_or_limit": [string],
+  "recommendation_notes": [string],
+  "rejection_reason": string|null
+}
+""",
+                remote_file,
+            ],
+            request_options={"timeout": 60},
+        )
+        text = _strip_code_fences(_extract_text_from_gemini(resp))
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = {
+                "is_medical_document": False,
+                "visible_text": text.strip(),
+                "rejection_reason": "The image could not be read as a prescription or medical document.",
+            }
+        if not isinstance(data, dict):
+            data = {"is_medical_document": False, "rejection_reason": str(data)}
+        return data
+    except Exception as exc:
+        return {"is_medical_document": False, "rejection_reason": "Prescription analysis failed.", "error": str(exc)}
+    finally:
+        try:
+            if remote_file is not None:
+                genai.delete_file(remote_file)
+        except Exception:
+            pass
+
+def _prescription_context_is_valid(context: Dict[str, Any]) -> bool:
+    if not isinstance(context, dict):
+        return False
+    medical_flag = context.get("is_medical_document")
+    if not (medical_flag is True or str(medical_flag).strip().lower() == "true"):
+        return False
+    visible_text = str(context.get("visible_text") or "").strip()
+    extracted_lists = []
+    for key in ("health_context", "nutrition_considerations", "avoid_or_limit", "recommendation_notes"):
+        value = context.get(key)
+        if isinstance(value, list):
+            extracted_lists.extend(str(item).strip() for item in value if str(item).strip())
+    return len(visible_text) >= 8 or bool(extracted_lists)
+
+def _prescription_rejection_message(context: Dict[str, Any]) -> str:
+    reason = str((context or {}).get("rejection_reason") or "").strip()
+    return reason or "Please upload a clear prescription or medical document image."
+
 # ---------- FastAPI ----------
 app = FastAPI(title="Kedo API (Gemini 2.5 Flash)")
 app.add_middleware(
@@ -1105,12 +1516,63 @@ def meal_image(query: str = "simple keto meal"):
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
+@app.post("/speech/transcribe")
+async def transcribe_speech(file: UploadFile = File(...)):
+    if not _gemini:
+        return {"ok": False, "error": "Gemini API key is not configured."}
+
+    payload = await file.read()
+    if not payload:
+        return {"ok": False, "error": "No audio was recorded."}
+    if len(payload) > 12 * 1024 * 1024:
+        return {"ok": False, "error": "Audio clip is too long. Try a shorter hold-to-talk clip."}
+
+    upload_dir = BASE_DIR / "uploads" / "speech"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    suffix = ".m4a"
+    filename = (file.filename or "").lower()
+    for ext in (".m4a", ".aac", ".mp3", ".wav", ".webm"):
+        if filename.endswith(ext):
+            suffix = ext
+            break
+    audio_path = upload_dir / f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}{suffix}"
+
+    remote_file = None
+    try:
+        audio_path.write_bytes(payload)
+        remote_file = genai.upload_file(audio_path, mime_type=_audio_mime_type(file))
+        remote_file = _wait_for_gemini_file(remote_file)
+        resp = _gemini.generate_content(
+            [
+                "Transcribe this audio into concise plain text. Return only the spoken words, no quotes and no explanation.",
+                remote_file,
+            ],
+            request_options={"timeout": 60},
+        )
+        text = _extract_text_from_gemini(resp).strip()
+        if not text:
+            return {"ok": False, "error": "I could not hear any clear speech."}
+        return {"ok": True, "text": text}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        try:
+            if remote_file is not None:
+                genai.delete_file(remote_file)
+        except Exception:
+            pass
+        try:
+            audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 @app.post("/user/profile")
 def upsert_profile(p: UserProfile):
     if not p.meal_times:
         existing: Optional[UserProfile] = STATE.get("profile")
         p.meal_times = existing.meal_times if existing else DEFAULT_PROFILE.meal_times
     STATE["profile"] = p
+    _clear_today_plan()
     return {"ok": True}
 
 @app.get("/user/profile")
@@ -1120,18 +1582,93 @@ def get_profile():
         return {"profile": None}
     return {"profile": prof}
 
+@app.post("/auth/login")
+def login(payload: Dict[str, Any]):
+    email = str(payload.get("email", "")).strip().lower()
+    password = str(payload.get("password", ""))
+    if email == DEFAULT_EMAIL and password == DEFAULT_PASSWORD:
+        STATE["auth"] = {"email": DEFAULT_EMAIL, "logged_in": True}
+        return {"ok": True, "email": DEFAULT_EMAIL}
+    return {"ok": False, "error": "invalid_credentials", "message": "Email or password is incorrect."}
+
+@app.post("/auth/logout")
+def logout():
+    STATE["auth"] = {"email": DEFAULT_EMAIL, "logged_in": False}
+    return {"ok": True}
+
+@app.get("/auth/session")
+def auth_session():
+    auth = STATE.get("auth") or {"email": DEFAULT_EMAIL, "logged_in": True}
+    return {"email": auth.get("email") or DEFAULT_EMAIL, "logged_in": bool(auth.get("logged_in", True))}
+
+@app.get("/reminders")
+def get_reminders():
+    schedule = _current_reminders()
+    today_key = _today_key()
+    today_item = schedule[today_key]
+    return {
+        "schedule": schedule,
+        "today_key": today_key,
+        "today": today_item,
+        "fasting_today": bool(today_item.get("fasting")),
+    }
+
+@app.post("/reminders")
+def update_reminders(payload: Dict[str, Any]):
+    raw_schedule = payload.get("schedule") if isinstance(payload, dict) else None
+    schedule = _normalize_reminder_schedule(raw_schedule)
+    validation = _validate_reminder_schedule(schedule)
+    if validation:
+        return validation
+    STATE["reminders"] = schedule
+    _sync_profile_meal_times_from_today()
+    _clear_today_plan()
+    return {
+        "ok": True,
+        "schedule": schedule,
+        "today_key": _today_key(),
+        "today": schedule[_today_key()],
+        "fasting_today": bool(schedule[_today_key()].get("fasting")),
+    }
+
 @app.post("/user/prescription")
 async def upload_prescription(file: UploadFile = File(...)):
-    os.makedirs("uploads/prescriptions", exist_ok=True)
-    filename = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{file.filename}"
-    path = os.path.join("uploads", "prescriptions", filename)
-    with open(path, "wb") as f:
-        f.write(await file.read())
-    STATE.setdefault("user_docs", {})["prescription_path"] = path
-    return {"ok": True, "path": path}
+    if not _is_supported_image_upload(file):
+        return _validation_error("Please upload a clear photo or image file of a prescription or medical document.")
+
+    payload = await file.read()
+    if not payload:
+        return _validation_error("The selected image was empty. Please choose a clear prescription image.")
+
+    upload_dir = BASE_DIR / "uploads" / "prescriptions"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    raw_name = Path(file.filename or "prescription.jpg").name
+    filename = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{raw_name}"
+    path = upload_dir / filename
+    path.write_bytes(payload)
+
+    context = _analyze_prescription_image(path, file)
+    if not _prescription_context_is_valid(context):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return _validation_error(_prescription_rejection_message(context))
+
+    docs = STATE.setdefault("user_docs", {})
+    docs["prescription_path"] = str(path)
+    docs["prescription_context"] = context
+    _clear_today_plan()
+    return {"ok": True, "path": str(path), "context": context}
 
 @app.post("/pantry/update")
 def update_pantry(pantry: Pantry):
+    invalid = _invalid_pantry_item_names(pantry)
+    if invalid:
+        return _validation_error(
+            "These do not look like edible pantry items. Please keep pantry entries to ingredients or food.",
+            invalid,
+        )
     STATE["pantry"] = pantry
     _clear_today_plan()
     return {"ok": True}
@@ -1151,7 +1688,17 @@ async def remake_pantry(request: Request):
     if not text.strip():
         return {"ok": False, "error": "text_missing", "pantry": STATE.get("pantry")}
 
+    validation = _validate_pantry_text(text)
+    if validation:
+        validation["pantry"] = STATE.get("pantry")
+        return validation
+
     pantry = _pantry_from_text(text)
+    validation = _validate_pantry_text(text, pantry)
+    if validation:
+        validation["pantry"] = STATE.get("pantry")
+        return validation
+
     STATE["pantry"] = pantry
     _clear_today_plan()
     return {"ok": True, "pantry": STATE["pantry"]}
@@ -1161,9 +1708,20 @@ async def add_pantry_items(request: Request):
     text = await _read_text_payload(request)
     if not text.strip():
         return {"ok": False, "error": "text_missing", "pantry": STATE.get("pantry")}
+
+    validation = _validate_pantry_text(text)
+    if validation:
+        validation["pantry"] = STATE.get("pantry")
+        return validation
+
     additions = _pantry_from_text(text)
     if not additions.items:
         return {"ok": False, "error": "no_items_found", "pantry": STATE.get("pantry")}
+    validation = _validate_pantry_text(text, additions)
+    if validation:
+        validation["pantry"] = STATE.get("pantry")
+        return validation
+
     pantry = _merge_pantry_items(STATE.get("pantry", Pantry(items=[])), additions)
     STATE["pantry"] = pantry
     _clear_today_plan()
@@ -1177,6 +1735,15 @@ def meals_recommendations():
     if not profile:
         return {"error": "profile_missing"}
 
+    _sync_profile_meal_times_from_today()
+    if _is_fasting_today():
+        STATE.setdefault("plans", {})[str(date.today())] = []
+        return {
+            "state": "FASTING",
+            "message": "Today is marked as a fasting day. No meal recommendations will be generated.",
+            "meals": [],
+        }
+
     clar = ensure_meal_times(profile)
     if clar:
         return {"state": "NEED_CLARIFICATION", "clarification": clar.model_dump()}
@@ -1184,7 +1751,7 @@ def meals_recommendations():
     if not _pantry_names(pantry):
         return {"state": "NEED_PANTRY", "message": "Add pantry items before requesting meals."}
 
-    generated = _generate_pantry_only_meals(profile, pantry, count=3, attempts=3)
+    generated = _generate_pantry_only_meals(profile, pantry, count=3, attempts=1)
     meals = generated["meals"]
     if len(meals) < 3:
         return {"state": "LLM_ERROR", "error": generated["error"] or {"_error": "not_enough_pantry_only_meals"}, "meals": meals}
@@ -1193,6 +1760,13 @@ def meals_recommendations():
 
 @app.get("/plan/today")
 def get_today_plan():
+    if _is_fasting_today():
+        return {
+            "date": str(date.today()),
+            "state": "FASTING",
+            "message": "Today is marked as a fasting day. No meal recommendations will be generated.",
+            "meals": [],
+        }
     plan = STATE.get("plans", {}).get(str(date.today()))
     if isinstance(plan, list):
         pantry: Pantry = STATE.get("pantry")
@@ -1206,14 +1780,19 @@ def suggest_another(slot: str = "Lunch", guidance: Optional[str] = None):
     pantry: Pantry = STATE.get("pantry")
     if not profile:
         return {"error": "profile_missing"}
+    if _is_fasting_today():
+        return {"error": {"_error": "fasting_day", "detail": "Today is marked as a fasting day."}}
     if not _pantry_names(pantry):
         return {"error": {"_error": "pantry_empty", "detail": "Add pantry items before requesting meals."}}
+    validation = _validate_guidance_text(guidance)
+    if validation:
+        return {"error": validation}
 
     counter_key = f"{date.today()}:{slot}"
     counters = STATE.setdefault("suggestion_counters", {})
     counters[counter_key] = counters.get(counter_key, 0) + 1
     directed_guidance = " ".join(part for part in [guidance or "", f"variation {counters[counter_key]}"] if part).strip()
-    generated = _generate_pantry_only_meals(profile, pantry, count=1, slot=slot, guidance=directed_guidance, attempts=3)
+    generated = _generate_pantry_only_meals(profile, pantry, count=1, slot=slot, guidance=directed_guidance, attempts=1)
     if not generated["meals"]:
         return {"error": generated["error"] or {"_error": "no_pantry_only_meals"}}
     return {"meal": generated["meals"][0]}
@@ -1224,10 +1803,12 @@ def recommend_snack(max_calories: int = 300):
     pantry: Pantry = STATE.get("pantry")
     if not profile:
         return {"error": "profile_missing"}
+    if _is_fasting_today():
+        return {"error": {"_error": "fasting_day", "detail": "Today is marked as a fasting day."}}
     if not _pantry_names(pantry):
         return {"error": {"_error": "pantry_empty", "detail": "Add pantry items before requesting snacks."}}
 
-    generated = _generate_pantry_only_meals(profile, pantry, count=1, slot="Snack", max_calories=max_calories, attempts=3)
+    generated = _generate_pantry_only_meals(profile, pantry, count=1, slot="Snack", max_calories=max_calories, attempts=1)
     if not generated["meals"]:
         return {"error": generated["error"] or {"_error": "no_pantry_only_meals"}}
     return {"meal": generated["meals"][0]}
@@ -1249,6 +1830,10 @@ def log_eaten(meal: Meal):
 
 @app.post("/meals/log_custom")
 def log_custom(food: CustomFood):
+    validation = _validate_custom_food_text(food.free_text)
+    if validation:
+        return validation
+
     prompt = f"""
 Estimate macronutrients in grams for: "{food.free_text}".
 Return ONLY a JSON object:
@@ -1271,11 +1856,11 @@ Return ONLY a JSON object:
     day["fat"] += f
     totals[str(date.today())] = day
     STATE["totals"] = totals
-    return {"macros": data, "totals": day}
+    return {"ok": True, "macros": data, "totals": day}
 
 @app.get("/macros/targets")
 def macros_targets():
-    targets = {"calories": 1800.0, "protein": 120.0, "carbs": 30.0, "fat": 135.0}
+    targets = _macro_targets_for_profile(STATE.get("profile"), fasting=_is_fasting_today())
     STATE["targets"] = targets
     return {"targets": targets}
 
@@ -1299,6 +1884,9 @@ def resolve_clar(payload: Dict[str, Any]):
             meal_times = {"breakfast": str(mt.get("breakfast", "")), "lunch": str(mt.get("lunch", "")), "dinner": str(mt.get("dinner", ""))}
     if not meal_times:
         return {"ok": False, "error": "meal_times_missing"}
+    validation = _validate_meal_times(meal_times)
+    if validation:
+        return validation
     prof: UserProfile = STATE.get("profile")
     if prof:
         prof.meal_times = meal_times
@@ -1318,13 +1906,17 @@ try:
         profile: UserProfile = STATE.get("profile")
         if not profile:
             return
+        if _is_fasting_today():
+            STATE.setdefault("plans", {})[str(date.today())] = []
+            return
+        _sync_profile_meal_times_from_today()
         clar = ensure_meal_times(profile)
         if clar:
             return
         pantry: Pantry = STATE.get("pantry")
         if not _pantry_names(pantry):
             return
-        generated = _generate_pantry_only_meals(profile, pantry, count=3, attempts=3)
+        generated = _generate_pantry_only_meals(profile, pantry, count=3, attempts=1)
         meals = generated["meals"]
         if len(meals) == 3:
             STATE.setdefault("plans", {})[str(date.today())] = meals

@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, Alert, Modal, TextInput, ScrollView, TouchableOpacity, StyleSheet, Image, Animated, Easing } from 'react-native';
-import * as Calendar from 'expo-calendar';
+import { View, Text, Alert, Modal, ScrollView, TouchableOpacity, StyleSheet, Image, Animated, Easing, TextInput } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import BarChart from '../components/BarChart';
+import VoiceTextInput from '../components/VoiceTextInput';
 import { API, get, post } from '../lib/api';
-import { FEATURE_FLAGS } from '../config/api';
+import { apiMessage } from '../lib/messages';
 
 const e = (s) => (s == null ? '' : String(s));
 
@@ -92,6 +92,20 @@ const DUMMY_MEALS = [
 
 const SLOTS = ['Breakfast','Lunch','Dinner'];
 
+const DAY_LABELS = [
+  ['monday', 'Mon'],
+  ['tuesday', 'Tue'],
+  ['wednesday', 'Wed'],
+  ['thursday', 'Thu'],
+  ['friday', 'Fri'],
+  ['saturday', 'Sat'],
+  ['sunday', 'Sun'],
+];
+
+const defaultReminderSchedule = () => Object.fromEntries(
+  DAY_LABELS.map(([day]) => [day, { fasting: false, breakfast: '08:00', lunch: '13:00', dinner: '20:00' }])
+);
+
 function CardContainer({ loading, children }) {
   const anim = React.useRef(new Animated.Value(0)).current;
   useEffect(() => {
@@ -124,11 +138,21 @@ export default function HomeScreen() {
   const [directionModal, setDirectionModal] = useState(false);
   const [directionText, setDirectionText] = useState('');
   const [directionTarget, setDirectionTarget] = useState(null);
+  const [reminderModal, setReminderModal] = useState(false);
+  const [reminders, setReminders] = useState(defaultReminderSchedule());
+  const [todayKey, setTodayKey] = useState('');
+  const [fastingToday, setFastingToday] = useState(false);
 
   async function fetchMeals() {
     try {
       setNotice('');
       const plan = await get('/plan/today');
+      if (plan?.state === 'FASTING') {
+        setFastingToday(true);
+        setMeals([]);
+        setNotice(plan.message || 'Today is marked as a fasting day.');
+        return;
+      }
       if (Array.isArray(plan?.meals) && plan.meals.length === 3) {
         const nextMeals = plan.meals.map((m, i) => withRenderableImage({ ...m, _slot: SLOTS[i] || m._slot || 'Meal' }));
         prefetchMealImages(nextMeals);
@@ -136,6 +160,12 @@ export default function HomeScreen() {
         return;
       }
       const r = await get('/meals/recommendations');
+      if (r.state === 'FASTING') {
+        setFastingToday(true);
+        setMeals([]);
+        setNotice(r.message || 'Today is marked as a fasting day.');
+        return;
+      }
       if (r.state === 'NEED_CLARIFICATION') { setClarModal(true); setMeals([]); return; }
       if (r.state === 'NEED_PANTRY') { setNotice(r.message || 'Add pantry items before requesting meals.'); setMeals([]); return; }
       if (r.state === 'LLM_ERROR' || r.error) {
@@ -156,6 +186,22 @@ export default function HomeScreen() {
     }
   }
 
+  async function fetchReminders() {
+    try {
+      const data = await get('/reminders');
+      if (data?.schedule) setReminders(data.schedule);
+      if (data?.today_key) setTodayKey(data.today_key);
+      if (data?.today) {
+        setFastingToday(!!data.today.fasting);
+        setMealTimes({
+          breakfast: data.today.breakfast || '08:00',
+          lunch: data.today.lunch || '13:00',
+          dinner: data.today.dinner || '20:00',
+        });
+      }
+    } catch {}
+  }
+
   async function fetchMacros() {
     try {
       const t = await get('/macros/targets');
@@ -167,6 +213,7 @@ export default function HomeScreen() {
 
   useFocusEffect(
     React.useCallback(() => {
+      fetchReminders();
       fetchMeals();
       fetchMacros();
     }, [])
@@ -174,11 +221,15 @@ export default function HomeScreen() {
 
   async function resolveClar() {
     try {
-      await post('/clarifications/resolve', { meal_times: mealTimes });
+      const result = await post('/clarifications/resolve', { meal_times: mealTimes });
+      if (!result?.ok) {
+        Alert.alert('Could not save meal times', apiMessage(result, 'Use 24-hour times like 08:00.'));
+        return;
+      }
       setClarModal(false);
       fetchMeals();
     } catch (error) {
-      Alert.alert('Could not save meal times', error.message);
+      Alert.alert('Could not save meal times', apiMessage(error, 'Use 24-hour times like 08:00.'));
     }
   }
   useEffect(() => {
@@ -228,11 +279,15 @@ export default function HomeScreen() {
       const params = guidance.trim() ? { slot, guidance: guidance.trim() } : { slot };
       r = await get('/meals/suggest_another', params);
     } catch (error) {
-      Alert.alert('Could not suggest a meal', error.message);
+      Alert.alert('Could not suggest a meal', apiMessage(error, 'Please try again.'));
       setMeals(old => { if (!old) return old; const copy = [...old]; if (copy[idx]) copy[idx]._loading = false; return copy; });
       return;
     }
-    if (!r || r.error) { setMeals(old => { if (!old) return old; const copy = [...old]; if (copy[idx]) copy[idx]._loading = false; return copy; }); return; }
+    if (!r || r.error) {
+      Alert.alert('Could not suggest a meal', apiMessage(r?.error || r, 'Please give a clear food preference.'));
+      setMeals(old => { if (!old) return old; const copy = [...old]; if (copy[idx]) copy[idx]._loading = false; return copy; });
+      return;
+    }
     const oneRaw = Array.isArray(r.meal) ? r.meal[0] : r.meal;
     if (!oneRaw || typeof oneRaw !== 'object') { setMeals(old => { if (!old) return old; const copy = [...old]; if (copy[idx]) copy[idx]._loading = false; return copy; }); return; }
     const one = withRenderableImage({
@@ -264,59 +319,30 @@ export default function HomeScreen() {
     setDirectionText('');
     await suggestAnother(target.slot, target.idx, text);
   }
-  async function addToCalendar() {
-    if (!FEATURE_FLAGS.CALENDAR_INTEGRATION) {
-      Alert.alert('Feature Disabled', 'Calendar integration is currently disabled. Please check your configuration.');
-      return;
-    }
+  function updateReminder(day, key, value) {
+    setReminders(current => ({
+      ...current,
+      [day]: {
+        ...(current?.[day] || { fasting: false, breakfast: '08:00', lunch: '13:00', dinner: '20:00' }),
+        [key]: value,
+      },
+    }));
+  }
 
+  async function saveReminders() {
     try {
-      const { status } = await Calendar.requestCalendarPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission Denied', 'Calendar permission is required to add meal reminders.');
+      const result = await post('/reminders', { schedule: reminders });
+      if (!result?.ok) {
+        Alert.alert('Could not save reminders', apiMessage(result, 'Use times like 08:00, 13:00, and 20:00.'));
         return;
       }
-      
-      const list = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
-      const calId = list[0]?.id;
-      if (!calId || !meals) {
-        Alert.alert('Error', 'No calendar available or no meals to add.');
-        return;
-      }
-
-      const today = new Date();
-      const slots = ['breakfast','lunch','dinner'];
-      let eventsCreated = 0;
-      
-      for (let i = 0; i < slots.length; i++) {
-        const key = slots[i]; 
-        const time = mealTimes[key] || '08:00';
-        const [H, M] = time.split(':').map(Number);
-        const start = new Date(today.getFullYear(), today.getMonth(), today.getDate(), H, M);
-        const end = new Date(start.getTime() + 45*60*1000);
-        const title = `${key[0].toUpperCase()+key.slice(1)}: ${meals[i]?.dish_name || ''}`;
-        
-        try {
-          await Calendar.createEventAsync(calId, { 
-            title, 
-            startDate: start, 
-            endDate: end, 
-            notes: 'Open in Kedo for recipe details' 
-          });
-          eventsCreated++;
-        } catch (error) {
-          console.error(`Failed to create event for ${key}:`, error);
-        }
-      }
-      
-      if (eventsCreated > 0) {
-        Alert.alert('Success', `Created ${eventsCreated} meal reminders in your calendar!`);
-      } else {
-        Alert.alert('Error', 'Failed to create calendar events. Please try again.');
-      }
+      setReminderModal(false);
+      await fetchReminders();
+      await fetchMeals();
+      await fetchMacros();
+      Alert.alert('Reminders saved', result?.fasting_today ? 'Today is now a fasting day, so recommendations are paused.' : 'Meal reminder times are updated.');
     } catch (error) {
-      console.error('Calendar error:', error);
-      Alert.alert('Error', 'Failed to access calendar. Please check your permissions.');
+      Alert.alert('Could not save reminders', apiMessage(error, 'Please try again.'));
     }
   }
   async function submitCustomFood() {
@@ -325,7 +351,11 @@ export default function HomeScreen() {
     try {
       r = await post('/meals/log_custom', { free_text: customText });
     } catch (error) {
-      Alert.alert('Could not log food', error.message);
+      Alert.alert('Could not log food', apiMessage(error, 'Please try again.'));
+      return;
+    }
+    if (!r?.ok && r?.error) {
+      Alert.alert('Could not log food', apiMessage(r, 'Please describe the food you ate.'));
       return;
     }
     const m = r?.macros || { protein: 0, carbs: 0, fat: 0 };
@@ -390,17 +420,18 @@ export default function HomeScreen() {
 
       <View style={{ marginVertical: 12 }}>
         <Text style={styles.h2}>Today’s Meal Schedule</Text>
-        <Text style={{ color: '#C7D2FE' }}>Breakfast: {mealTimes.breakfast} | Lunch: {mealTimes.lunch} | Dinner: {mealTimes.dinner}</Text>
+        {fastingToday ? (
+          <Text style={{ color: '#FBBF24' }}>Fasting day active. Meal recommendations are paused today.</Text>
+        ) : (
+          <Text style={{ color: '#C7D2FE' }}>Breakfast: {mealTimes.breakfast} | Lunch: {mealTimes.lunch} | Dinner: {mealTimes.dinner}</Text>
+        )}
         <View style={{ height: 8 }} />
         <TouchableOpacity 
-          style={[
-            styles.cta, 
-            !FEATURE_FLAGS.CALENDAR_INTEGRATION && { backgroundColor: '#6B7280' }
-          ]} 
-          onPress={addToCalendar}
+          style={styles.cta}
+          onPress={() => setReminderModal(true)}
         >
           <Text style={styles.ctaText}>
-            {FEATURE_FLAGS.CALENDAR_INTEGRATION ? '📅 Add to Calendar' : '📅 Calendar (Disabled)'}
+            Set Reminders
           </Text>
         </TouchableOpacity>
       </View>
@@ -410,7 +441,7 @@ export default function HomeScreen() {
       {Array.isArray(meals) && meals.length === 0 && !notice && (
         <Text style={{ color: '#9CA3AF', marginBottom: 8 }}>No pantry-only meals available yet.</Text>
       )}
-      {!meals && <Text style={{ color: '#9CA3AF' }}>Loading or waiting for clarification…</Text>}
+      {!meals && <Text style={{ color: '#9CA3AF' }}>Generating today's recommendations...</Text>}
 
       {meals && meals.filter(Boolean).map((m, idx) => (
         <CardContainer key={idx} loading={!!m._loading}>
@@ -502,10 +533,14 @@ export default function HomeScreen() {
       <TouchableOpacity style={styles.cta} onPress={() => setCustomModal(true)}>
         <Text style={styles.ctaText}>I Ate Something Else</Text>
       </TouchableOpacity>
-      <View style={{ height: 8 }} />
-      <TouchableOpacity style={[styles.cta, { backgroundColor: '#10B981' }]} onPress={recommendSnack}>
-        <Text style={styles.ctaText}>Recommend Snack</Text>
-      </TouchableOpacity>
+      {!fastingToday && (
+        <>
+          <View style={{ height: 8 }} />
+          <TouchableOpacity style={[styles.cta, { backgroundColor: '#10B981' }]} onPress={recommendSnack}>
+            <Text style={styles.ctaText}>Recommend Snack</Text>
+          </TouchableOpacity>
+        </>
+      )}
 
       {/* Clarification Modal (HITL meal times) */}
       <Modal visible={clarModal} transparent animationType="fade">
@@ -515,7 +550,7 @@ export default function HomeScreen() {
             {['breakfast','lunch','dinner'].map(k => (
               <View key={k} style={{ marginVertical: 6 }}>
                 <Text style={styles.bold}>{k[0].toUpperCase()+k.slice(1)}</Text>
-                <TextInput
+                <VoiceTextInput
                   style={styles.input}
                   value={mealTimes[k]}
                   onChangeText={(v) => setMealTimes({ ...mealTimes, [k]: v })}
@@ -536,7 +571,7 @@ export default function HomeScreen() {
         <View style={styles.modalWrap}>
           <View style={styles.modalCard}>
             <Text style={styles.h2}>What did you eat?</Text>
-            <TextInput
+            <VoiceTextInput
               style={[styles.input, { height: 100 }]}
               value={customText}
               onChangeText={setCustomText}
@@ -560,7 +595,7 @@ export default function HomeScreen() {
         <View style={styles.modalWrap}>
           <View style={styles.modalCard}>
             <Text style={styles.h2}>What would you like?</Text>
-            <TextInput
+            <VoiceTextInput
               style={[styles.input, { height: 100 }]}
               value={directionText}
               onChangeText={setDirectionText}
@@ -574,6 +609,56 @@ export default function HomeScreen() {
             </TouchableOpacity>
             <View style={{ height: 8 }} />
             <TouchableOpacity style={[styles.cta, { backgroundColor: '#EF4444' }]} onPress={() => setDirectionModal(false)}>
+              <Text style={styles.ctaText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={reminderModal} transparent animationType="fade">
+        <View style={styles.modalWrap}>
+          <View style={[styles.modalCard, { maxHeight: '88%' }]}>
+            <Text style={styles.h2}>Weekly Reminders</Text>
+            <ScrollView showsVerticalScrollIndicator={false}>
+              {DAY_LABELS.map(([day, label]) => {
+                const item = reminders?.[day] || { fasting: false, breakfast: '08:00', lunch: '13:00', dinner: '20:00' };
+                return (
+                  <View key={day} style={[styles.reminderDay, todayKey === day && styles.reminderToday]}>
+                    <View style={styles.reminderHeader}>
+                      <Text style={styles.reminderDayText}>{label}</Text>
+                      <TouchableOpacity
+                        style={[styles.fastToggle, item.fasting && styles.fastToggleOn]}
+                        onPress={() => updateReminder(day, 'fasting', !item.fasting)}
+                      >
+                        <Text style={styles.fastToggleText}>{item.fasting ? 'Fasting' : 'Meals'}</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <View style={[styles.reminderTimes, item.fasting && styles.reminderTimesDisabled]}>
+                      {['breakfast', 'lunch', 'dinner'].map(slot => (
+                        <View key={slot} style={styles.reminderTimeField}>
+                          <Text style={styles.reminderSlot}>{slot[0].toUpperCase() + slot.slice(1)}</Text>
+                          <TextInput
+                            style={styles.reminderInput}
+                            value={String(item[slot] || '')}
+                            onChangeText={(value) => updateReminder(day, slot, value)}
+                            placeholder="08:00"
+                            placeholderTextColor="#64748B"
+                            keyboardType="numbers-and-punctuation"
+                            editable={!item.fasting}
+                          />
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                );
+              })}
+            </ScrollView>
+            <View style={{ height: 8 }} />
+            <TouchableOpacity style={styles.cta} onPress={saveReminders}>
+              <Text style={styles.ctaText}>Save Reminders</Text>
+            </TouchableOpacity>
+            <View style={{ height: 8 }} />
+            <TouchableOpacity style={[styles.cta, { backgroundColor: '#EF4444' }]} onPress={() => setReminderModal(false)}>
               <Text style={styles.ctaText}>Cancel</Text>
             </TouchableOpacity>
           </View>
@@ -612,4 +697,16 @@ const styles = StyleSheet.create({
   checkMark: { width: 16, height: 16, borderRadius: 4, borderWidth: 2, borderColor: '#334155', marginRight: 8 },
   checkOn: { backgroundColor: '#10B981', borderColor: '#10B981' },
   checkLabel: { color: '#E6EAF2', fontWeight: '600' },
+  reminderDay: { backgroundColor: '#141A22', borderRadius: 12, borderWidth: 1, borderColor: '#1F2937', padding: 10, marginBottom: 8 },
+  reminderToday: { borderColor: '#7C5CFC' },
+  reminderHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
+  reminderDayText: { color: '#E6EAF2', fontWeight: '800' },
+  fastToggle: { backgroundColor: '#334155', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
+  fastToggleOn: { backgroundColor: '#F59E0B' },
+  fastToggleText: { color: '#F9FAFB', fontWeight: '800' },
+  reminderTimes: { flexDirection: 'row', gap: 8 },
+  reminderTimesDisabled: { opacity: 0.45 },
+  reminderTimeField: { flex: 1 },
+  reminderSlot: { color: '#94A3B8', fontSize: 11, marginBottom: 4 },
+  reminderInput: { borderWidth: 1, borderColor: '#334155', borderRadius: 10, paddingVertical: 8, paddingHorizontal: 8, color: '#E6EAF2', backgroundColor: '#111827', textAlign: 'center' },
 });
