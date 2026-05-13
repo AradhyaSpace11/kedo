@@ -337,10 +337,37 @@ GUIDANCE_SIGNAL_WORDS = {
     "spicy", "mild", "sweet", "savory", "savoury", "crispy", "crunchy", "creamy",
     "quick", "easy", "light", "heavy", "breakfast", "lunch", "dinner", "snack",
     "protein", "carb", "carbs", "fat", "calorie", "calories", "keto", "veg",
-    "vegetarian", "nonveg", "chicken", "fish", "egg", "eggs", "paneer", "cheese",
-    "curry", "salad", "bowl", "grilled", "fried", "less", "more", "without",
-    "with", "avoid", "no", "limit", "indian", "asian", "mexican", "italian",
+    "veggie", "veggies", "vegetarian", "vegeterian", "vegitarian", "vegan",
+    "meatless", "plantbased", "plant", "based", "meat", "free", "nonveg", "nonvegetarian", "chicken", "fish",
+    "egg", "eggs", "paneer", "cheese", "tofu", "curry", "salad", "bowl",
+    "grilled", "fried", "less", "more", "without", "with", "avoid", "no",
+    "limit", "indian", "asian", "mexican", "italian", "jain", "satvik", "sattvic",
 }
+
+VEGETARIAN_GUIDANCE_WORDS = {
+    "veg", "veggie", "veggies", "vegetarian", "vegeterian", "vegitarian",
+    "meatless", "plantbased", "jain", "satvik", "sattvic",
+}
+VEGAN_GUIDANCE_WORDS = {"vegan", "plantbased"}
+NON_VEG_GUIDANCE_WORDS = {"nonveg", "nonvegetarian"}
+NON_VEGETARIAN_ITEM_WORDS = {
+    "beef", "pork", "chicken", "fish", "seafood", "shrimp", "prawn", "mutton",
+    "lamb", "meat", "egg", "eggs", "omelette", "salmon", "tuna",
+}
+DAIRY_ITEM_WORDS = {"paneer", "cheese", "milk", "yogurt", "yoghurt", "curd", "cream", "ghee", "butter"}
+
+CUISINE_KEYWORDS = [
+    ("japanese", "Japanese cuisine"),
+    ("korean", "Korean cuisine"),
+    ("thai", "Thai cuisine"),
+    ("chinese", "Chinese cuisine"),
+    ("vietnamese", "Vietnamese cuisine"),
+    ("asian", "Asian cuisine"),
+    ("mexican", "Mexican cuisine"),
+    ("italian", "Italian cuisine"),
+    ("mediterranean", "Mediterranean cuisine"),
+    ("indian", "Indian cuisine"),
+]
 
 def _validation_error(message: str, invalid_items: Optional[List[str]] = None) -> Dict[str, Any]:
     return {
@@ -432,6 +459,68 @@ def _validate_guidance_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
     if not (words & GUIDANCE_SIGNAL_WORDS or words & pantry_words):
         return _validation_error("Please give a clear food preference, ingredient, cuisine, or macro direction.")
     return None
+
+def _guidance_words(guidance: Optional[str]) -> set[str]:
+    return set(_text_words(str(guidance or "").replace("-", " ")))
+
+def _guidance_normalized(guidance: Optional[str]) -> str:
+    return " ".join(_text_words(str(guidance or "").replace("-", " ")))
+
+def _guidance_requests_non_veg(guidance: Optional[str]) -> bool:
+    words = _guidance_words(guidance)
+    normalized = _guidance_normalized(guidance)
+    return bool(words & NON_VEG_GUIDANCE_WORDS or "non veg" in normalized or "non vegetarian" in normalized)
+
+def _guidance_requests_vegan(guidance: Optional[str]) -> bool:
+    words = _guidance_words(guidance)
+    normalized = _guidance_normalized(guidance)
+    return bool(words & VEGAN_GUIDANCE_WORDS or "plant based" in normalized)
+
+def _guidance_requests_vegetarian(guidance: Optional[str]) -> bool:
+    if _guidance_requests_non_veg(guidance):
+        return False
+    words = _guidance_words(guidance)
+    normalized = _guidance_normalized(guidance)
+    return bool(
+        words & VEGETARIAN_GUIDANCE_WORDS
+        or "plant based" in normalized
+        or "meat free" in normalized
+        or "no meat" in normalized
+    )
+
+def _guidance_excluded_item_words(guidance: Optional[str]) -> set[str]:
+    if _guidance_requests_vegan(guidance):
+        return NON_VEGETARIAN_ITEM_WORDS | DAIRY_ITEM_WORDS
+    if _guidance_requests_vegetarian(guidance):
+        return NON_VEGETARIAN_ITEM_WORDS
+    return set()
+
+def _contains_guidance_excluded_item(value: Any, guidance: Optional[str]) -> bool:
+    excluded = _guidance_excluded_item_words(guidance)
+    if not excluded:
+        return False
+    words = set(_canonical_name(str(value or "")).split())
+    return bool(words & excluded)
+
+def _guidance_allows_meal(meal: Dict[str, Any], guidance: Optional[str]) -> bool:
+    if not _guidance_excluded_item_words(guidance):
+        return True
+    if _contains_guidance_excluded_item(meal.get("dish_name"), guidance):
+        return False
+    for ingredient in meal.get("ingredients") or []:
+        if _contains_guidance_excluded_item(ingredient.get("item"), guidance):
+            return False
+    for step in meal.get("recipe_steps") or []:
+        if _contains_guidance_excluded_item(step, guidance):
+            return False
+    return True
+
+def _guidance_rule_text(guidance: Optional[str]) -> str:
+    if _guidance_requests_vegan(guidance):
+        return "- User asked for vegan or plant-based food: do NOT use meat, chicken, fish, seafood, eggs, paneer, cheese, milk, yogurt, curd, cream, ghee, or butter."
+    if _guidance_requests_vegetarian(guidance):
+        return "- User asked for vegetarian food: do NOT use meat, chicken, fish, seafood, eggs, beef, pork, mutton, lamb, shrimp, or prawns. Prefer paneer, tofu, cheese, yogurt, vegetables, nuts, and other vegetarian pantry items."
+    return ""
 
 def _validate_custom_food_text(text: str) -> Optional[Dict[str, Any]]:
     basic = _validate_general_text(text, "what you ate")
@@ -1032,12 +1121,13 @@ def _fallback_pantry_meal(
     steps: List[str],
     macros: Dict[str, float],
     require_all_candidates: bool = False,
+    guidance: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     ingredients: List[Dict[str, str]] = []
     used = set()
     for group in candidates:
         item = _pick_pantry_item(pantry, group)
-        if item and _canonical_name(item) not in used:
+        if item and _canonical_name(item) not in used and not _contains_guidance_excluded_item(item, guidance):
             used.add(_canonical_name(item))
             ingredients.append({"item": item, "quantity": _serving_quantity_for_item(item, pantry)})
     if require_all_candidates and len(ingredients) < len(candidates):
@@ -1068,14 +1158,14 @@ def _fallback_pantry_meal(
         "recipe_steps": clean_steps,
         "video_link": None,
     }
-    return meal if not _meal_pantry_violations(meal, pantry) else None
+    return meal if not _meal_pantry_violations(meal, pantry) and _guidance_allows_meal(meal, guidance) else None
 
-def _usable_fallback_pantry_names(pantry: Pantry) -> List[str]:
+def _usable_fallback_pantry_names(pantry: Pantry, guidance: Optional[str] = None) -> List[str]:
     names: List[str] = []
     seen = set()
     for name in _pantry_names(pantry):
         key = _canonical_name(name)
-        if not key or "beef" in key or "pork" in key or key in seen:
+        if not key or "beef" in key or "pork" in key or key in seen or _contains_guidance_excluded_item(name, guidance):
             continue
         seen.add(key)
         names.append(name)
@@ -1134,7 +1224,7 @@ def _generic_fallback_pantry_meals(
     slot: Optional[str] = None,
     guidance: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    names = _usable_fallback_pantry_names(pantry)
+    names = _usable_fallback_pantry_names(pantry, guidance)
     if not names:
         return []
 
@@ -1175,6 +1265,7 @@ def _generic_fallback_pantry_meals(
             [[name] for name in selected[:3]],
             steps,
             _fallback_macros_for_names(selected[:3]),
+            guidance=guidance,
         )
         if meal:
             seen.add(key)
@@ -1233,7 +1324,7 @@ def _fallback_pantry_only_meals(
             break
         if _canonical_name(dish_name) in seen:
             continue
-        meal = _fallback_pantry_meal(pantry, dish_name, candidates, steps, macros, require_all_candidates=True)
+        meal = _fallback_pantry_meal(pantry, dish_name, candidates, steps, macros, require_all_candidates=True, guidance=guidance)
         if meal:
             seen.add(_canonical_name(dish_name))
             meals.append(meal)
@@ -1255,6 +1346,7 @@ def _pantry_only_prompt(
     calories_text = f" Total calories must be <= {max_calories}." if max_calories else ""
     exclude_text = f" Do not repeat these dish names: {', '.join(exclude_dishes)}." if exclude_dishes else ""
     guidance_text = f"\nUser direction for this regeneration: {guidance}" if guidance else ""
+    guidance_rule = _guidance_rule_text(guidance)
     prescription_context = _prescription_context_text()
     prescription_text = (
         "\nPrescription/medical document context for meal planning:\n"
@@ -1273,6 +1365,8 @@ ABSOLUTE RULES:
 - Every ingredient item in the JSON must match a pantry item.
 - Do NOT add salt, pepper, oil, water, spices, sauces, garnish, or optional ingredients unless that exact item is in the pantry.
 - Do NOT use beef or pork under any circumstance.
+- If the user direction asks for a diet style, follow it strictly.
+{guidance_rule}
 - Prefer Indian keto-style dishes.
 - Use concrete serving quantities for every ingredient, such as "2", "120 g", "10 ml", or "0.5 head". Never use "as available".
 - recipe_steps must only mention the listed meal ingredients and cooking actions.
@@ -1324,7 +1418,7 @@ def _generate_pantry_only_meals(
             last_error = data
             continue
         raw_meals = _normalize_meal_list(data) if count > 1 else [_normalize_meal(data, slot or "Meal")]
-        valid_meals = _filter_pantry_only_meals(raw_meals, pantry)
+        valid_meals = [meal for meal in _filter_pantry_only_meals(raw_meals, pantry) if _guidance_allows_meal(meal, guidance)]
         for meal in valid_meals:
             meal = _ensure_meal_quantities(meal, pantry)
             key = _canonical_name(meal.get("dish_name", ""))
@@ -1794,7 +1888,13 @@ def suggest_another(slot: str = "Lunch", guidance: Optional[str] = None):
     directed_guidance = " ".join(part for part in [guidance or "", f"variation {counters[counter_key]}"] if part).strip()
     generated = _generate_pantry_only_meals(profile, pantry, count=1, slot=slot, guidance=directed_guidance, attempts=1)
     if not generated["meals"]:
-        return {"error": generated["error"] or {"_error": "no_pantry_only_meals"}}
+        if _guidance_requests_vegan(guidance):
+            detail = "I could not make a vegan pantry-only meal from your current pantry. Add plant-based ingredients like tofu, vegetables, nuts, or coconut, then try again."
+        elif _guidance_requests_vegetarian(guidance):
+            detail = "I could not make a vegetarian pantry-only meal from your current pantry. Add vegetarian ingredients like paneer, tofu, vegetables, nuts, or dairy, then try again."
+        else:
+            detail = "I could not make a pantry-only meal for that direction. Try a different preference or add more matching pantry items."
+        return {"error": {"_error": "no_pantry_only_meals", "detail": detail, "raw": generated["error"]}}
     return {"meal": generated["meals"][0]}
 
 @app.get("/meals/recommend_snack")
